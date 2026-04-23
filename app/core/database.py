@@ -12,8 +12,10 @@ from app.core.config import get_settings
 settings = get_settings()
 
 # ── Engine ─────────────────────────────────────────────────
+# database_url is now a plain str — no str() cast needed,
+# but kept for safety in case settings is ever swapped back.
 engine = create_async_engine(
-    str(settings.database_url),
+    settings.database_url,
     pool_size=settings.db_pool_size,
     max_overflow=settings.db_max_overflow,
     echo=settings.debug,

@@ -50,7 +50,11 @@ celery_app.conf.update(
     task_track_started=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,
-    beat_scheduler="redbeat.RedBeatSchedulerEntry",
+    # FIX: suppress CPendingDeprecationWarning in Celery 5.x
+    broker_connection_retry_on_startup=True,
+    # FIX: correct module name is 'redbeat' not 'celery_redbeat'
+    # The PyPI package is 'celery-redbeat' but the Python module is 'redbeat'
+    beat_scheduler="redbeat.RedBeatScheduler",
     redbeat_redis_url=settings.celery_broker_url,
     beat_schedule={
         "fetch-news-every-4h": {
@@ -80,10 +84,6 @@ def run_async(coro):
 
 
 # ── Breaking news detection ───────────────────────────────────
-# FIX #14: is_breaking heuristic — flagged during summarization.
-# An article is breaking if it is < 3 hours old AND matches at least
-# one signal (keyword in title OR from a tier-1 wire service).
-
 _BREAKING_KEYWORDS = frozenset({
     "breaking", "urgent", "alert", "flash:", "just in",
     "developing", "emergency", "exclusive", "crisis",
@@ -211,8 +211,6 @@ async def _summarize_pending() -> dict:
     from app.services.summarizer import SummarizationService
     from app.services.translator import TranslationService
 
-    # Top languages to pre-translate (most common globally)
-    # FIX #15: th and vi added
     PRIORITY_LANGS = ["ar", "fr", "es", "pt", "sw", "hi", "zh", "id", "th", "vi"]
 
     summarizer = SummarizationService()
@@ -228,10 +226,7 @@ async def _summarize_pending() -> dict:
             try:
                 content = article.full_content_en or article.summary_en or article.title_en
                 summary = await summarizer.summarize(article.title_en, content)
-                # FIX #13: categorize now returns sports/climate/arts too
                 category = await summarizer.categorize(article.title_en, article.summary_en)
-
-                # FIX #14: detect breaking news
                 is_breaking = _detect_breaking(
                     article.title_en,
                     article.source_name,
@@ -248,7 +243,6 @@ async def _summarize_pending() -> dict:
                 )
                 summarized += 1
 
-                # Pre-translate for priority languages
                 for lang in PRIORITY_LANGS:
                     existing = await repo.get_translation(article.id, lang)
                     if existing:
@@ -268,8 +262,7 @@ async def _summarize_pending() -> dict:
                     except Exception as e:
                         log.warning("pre_translate_failed", lang=lang, error=str(e))
 
-                # FIX #20: commit after each article so progress is not lost
-                # if the task hits a time limit or crashes mid-batch.
+                # Commit after each article so a timeout can't wipe the batch
                 await db.commit()
 
             except Exception as e:
@@ -277,7 +270,6 @@ async def _summarize_pending() -> dict:
                 await db.rollback()
                 continue
 
-    # Invalidate story cache so fresh summaries are served immediately
     try:
         redis = await get_redis()
         cache = CacheClient(redis)

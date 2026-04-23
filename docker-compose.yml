@@ -68,8 +68,12 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
-    command: celery -A app.workers.tasks.celery_app worker --loglevel=info --concurrency=2
+    command: >
+      celery -A app.workers.tasks.celery_app worker
+      --loglevel=info
+      --concurrency=2
 
+  # ── Celery Beat (scheduler) ────────────────────────────────
   beat:
     build:
       context: .
@@ -80,7 +84,12 @@ services:
       - redis
     volumes:
       - .:/app
-    command: celery -A app.workers.tasks.celery_app beat --loglevel=info --scheduler celery_redbeat.RedBeatScheduler
+    # FIX: 'celery_redbeat' is wrong — the Python module is 'redbeat'
+    # PyPI package name is 'celery-redbeat' but import/scheduler is 'redbeat'
+    command: >
+      celery -A app.workers.tasks.celery_app beat
+      --loglevel=info
+      --scheduler redbeat.RedBeatScheduler
 
   # ── Flower (Celery monitoring) — dev only ──────────────────
   flower:

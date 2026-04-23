@@ -1,0 +1,176 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+pythonenv*
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+test-results/
+
+# FastAPI / Pydantic specific
+.pydantic/
+.pydantic_schema/
+*.pydantic_cache
+
+# Database files (if using SQLite locally)
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables
+.env
+.env.*
+!.env.example
+!.env.template
+.env.local
+.env.production
+.env.staging
+
+# Secrets and keys
+*.key
+*.pem
+*.crt
+*.p12
+secrets.json
+secrets.yaml
+credentials.json
+service-account.json
+
+# Logs
+logs/
+*.log
+logfile-*
+
+# Local development database data
+postgres_data/
+pgdata/
+redis_data/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# VSCode
+.vscode/
+*.code-workspace
+.settings/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+.elisp-autofu
+
+# Vim
+*.swp
+*.swo
+*~
+.~*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.bak
+desktop.ini
+
+# Docker
+*.pid
+docker-compose.override.yml
+.dockerignore
+.docker/
+
+# Alembic (migrations) - optionally exclude if you want migrations versioned
+# alembic/versions/*.py
+# !alembic/versions/.gitkeep
+
+# Static files collected
+staticfiles/
+static/
+media/
+uploads/
+
+# API documentation generated files
+docs/_build/
+site/
+
+# Backup files
+*.backup
+*.tmp
+*.temp
+
+# Project specific - FastAPI app cache
+.cache/
+.ruff_cache/
+
+# Deployment packages
+*.whl
+*.tar.gz
+*.zip
+
+# Secret scanning
+.gitleaks/
+.trufflehog/

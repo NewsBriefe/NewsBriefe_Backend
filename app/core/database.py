@@ -12,14 +12,18 @@ from app.core.config import get_settings
 settings = get_settings()
 
 # ── Engine ─────────────────────────────────────────────────
-# database_url is now a plain str — no str() cast needed,
-# but kept for safety in case settings is ever swapped back.
+# FIX: asyncpg by default attempts an SSL handshake before plain TCP.
+# PostgreSQL in Docker does not have SSL configured, so it responds
+# with 'N' (not supported). Some asyncpg + uvloop versions misinterpret
+# this as ConnectionRefusedError instead of falling back to plain TCP.
+# ssl=False tells asyncpg to skip SSL entirely — correct for Docker.
 engine = create_async_engine(
     settings.database_url,
     pool_size=settings.db_pool_size,
     max_overflow=settings.db_max_overflow,
     echo=settings.debug,
     pool_pre_ping=True,
+    connect_args={"ssl": False},
 )
 
 AsyncSessionLocal = async_sessionmaker(

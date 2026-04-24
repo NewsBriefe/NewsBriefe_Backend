@@ -1,6 +1,7 @@
 """
 FastAPI Application Factory
 """
+import asyncio
 import time
 import sentry_sdk
 from contextlib import asynccontextmanager
@@ -22,19 +23,62 @@ settings = get_settings()
 log = get_logger(__name__)
 
 
+async def _wait_for_db(max_retries: int = 10, delay: float = 2.0) -> None:
+    """
+    Retry the DB connection until postgres is ready.
+
+    Docker's healthcheck (pg_isready) can pass before postgres is fully
+    ready to accept connections from the network. This retry loop handles
+    that race condition cleanly instead of crashing on the first attempt.
+
+    Logs the URL being used on first attempt so connection problems
+    are immediately visible in the container logs.
+    """
+    from app.core.database import engine
+    from app.models.orm import Base
+    from sqlalchemy import text
+
+    log.info(
+        "db_connecting",
+        url=settings.database_url,
+        max_retries=max_retries,
+    )
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SELECT 1"))
+                if settings.is_development:
+                    await conn.run_sync(Base.metadata.create_all)
+            log.info("db_ready", attempt=attempt)
+            return
+        except Exception as exc:
+            if attempt == max_retries:
+                log.error(
+                    "db_connection_failed",
+                    url=settings.database_url,
+                    attempts=attempt,
+                    error=str(exc),
+                )
+                raise
+            log.warning(
+                "db_not_ready_retrying",
+                attempt=attempt,
+                max=max_retries,
+                delay=delay,
+                error=str(exc),
+            )
+            await asyncio.sleep(delay)
+
+
 # ── Lifespan (startup / shutdown) ────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
     log.info("newsbrief_api_starting", version=settings.app_version, env=settings.environment)
 
-    # Create DB tables (dev only — use alembic in production)
-    if settings.is_development:
-        from app.core.database import engine
-        from app.models.orm import Base
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        log.info("db_tables_created")
+    await _wait_for_db()
+    log.info("db_tables_created")
 
     yield
 
@@ -83,7 +127,7 @@ def create_app() -> FastAPI:
     # ── CORS ─────────────────────────────────────────────
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.allowed_origins,
+        allow_origins=settings.allowed_origins if settings.allowed_origins else ["*"],
         allow_credentials=True,
         allow_methods=["GET", "POST"],
         allow_headers=["*"],

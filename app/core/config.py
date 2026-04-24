@@ -1,12 +1,19 @@
+import os
 from functools import lru_cache
 from typing import Any
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# When running inside Docker, DOCKER=true is set in the environment block.
+# We skip reading the .env file entirely so that the local .env file
+# (which has localhost URLs) can never override the Docker hostnames.
+# Local dev (no DOCKER var set) still reads .env normally.
+_running_in_docker = os.getenv("DOCKER", "").lower() == "true"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=None if _running_in_docker else ".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
     )
@@ -23,16 +30,14 @@ class Settings(BaseSettings):
     api_key: str = Field(default="")
 
     # ── Database ─────────────────────────────────────────
-    # FIX: plain str instead of PostgresDsn.
-    # Pydantic v2's PostgresDsn silently fails to override when the value
-    # contains the +asyncpg dialect suffix, causing it to fall back to the
-    # localhost default — so the container connects to itself, not postgres.
+    # Default uses "postgres" (Docker service name).
+    # Local dev must set DATABASE_URL in .env with "localhost".
     database_url: str = "postgresql+asyncpg://newsbrief:newsbrief@postgres:5432/newsbrief"
     db_pool_size: int = 10
     db_max_overflow: int = 20
 
-    # ── Redis ────────────────────────────────────────────
-    # FIX: plain str instead of RedisDsn for the same reason.
+    # ── Redis ─────────────────────────────────────────────
+    # Default uses "redis" (Docker service name).
     redis_url: str = "redis://redis:6379/0"
     cache_ttl_seconds: int = 14_400  # 4 hours
 

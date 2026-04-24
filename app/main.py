@@ -3,6 +3,7 @@ FastAPI Application Factory
 """
 import asyncio
 import time
+
 import sentry_sdk
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
@@ -18,6 +19,8 @@ from app.core.config import get_settings
 from app.core.logging import setup_logging, get_logger
 from app.core.cache import close_redis
 from app.api.v1.endpoints.routes import router
+
+from .models.orm import HealthResponse
 
 settings = get_settings()
 log = get_logger(__name__)
@@ -175,7 +178,18 @@ def create_app() -> FastAPI:
                 "message": "An unexpected error occurred",
             },
         )
+    # ============================================================================
+    # Health & Status Endpoints
+    # ============================================================================
 
+    @app.get("/health", response_model=HealthResponse)
+    async def health_check():
+        """Health check endpoint."""
+        
+        return HealthResponse(
+            version="1.0.0",
+            status="operational/healthy"
+        )
     # ── Routes ───────────────────────────────────────────
     app.include_router(
         router,

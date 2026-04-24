@@ -3,6 +3,7 @@ Database ORM models.
 Separate from Pydantic schemas — ORM models are the DB layer,
 Pydantic schemas are the API contract layer.
 """
+from typing import Dict
 import uuid
 from datetime import datetime
 from sqlalchemy import (
@@ -12,6 +13,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
+from pydantic import BaseModel, Field, field_validator
 
 
 class Article(Base):
@@ -101,6 +103,15 @@ class ArticleTranslation(Base):
         UniqueConstraint("article_id", "language_code", name="uq_article_lang"),
         Index("ix_translations_article_lang", "article_id", "language_code"),
     )
+
+# ============================================================================
+# Health & Status
+# ============================================================================
+
+class HealthResponse(BaseModel):
+    """Health check response."""
+    status: str = Field(default="healthy")
+    version: str = Field(default="1.0.0")
 
 
 class FetchLog(Base):

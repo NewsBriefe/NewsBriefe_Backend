@@ -4,10 +4,6 @@ from typing import Any
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# When running inside Docker, DOCKER=true is set in the environment block.
-# We skip reading the .env file entirely so that the local .env file
-# (which has localhost URLs) can never override the Docker hostnames.
-# Local dev (no DOCKER var set) still reads .env normally.
 _running_in_docker = os.getenv("DOCKER", "").lower() == "true"
 
 
@@ -30,26 +26,34 @@ class Settings(BaseSettings):
     api_key: str = Field(default="")
 
     # ── Database ─────────────────────────────────────────
-    # Default uses "postgres" (Docker service name).
-    # Local dev must set DATABASE_URL in .env with "localhost".
     database_url: str = "postgresql+asyncpg://newsbrief:newsbrief@postgres:5432/newsbrief"
     db_pool_size: int = 10
     db_max_overflow: int = 20
 
     # ── Redis ─────────────────────────────────────────────
-    # Default uses "redis" (Docker service name).
     redis_url: str = "redis://redis:6379/0"
-    cache_ttl_seconds: int = 14_400  # 4 hours
+    cache_ttl_seconds: int = 14_400
 
     # ── Celery ────────────────────────────────────────────
     celery_broker_url: str = "redis://redis:6379/1"
     celery_result_backend: str = "redis://redis:6379/2"
 
-    # ── AI / Claude ──────────────────────────────────────
+    # ── AI Provider ───────────────────────────────────────
+    # Set AI_PROVIDER=bedrock to use AWS Bedrock DeepSeek R1
+    # Set AI_PROVIDER=claude (default) to use Anthropic Claude
+    ai_provider: str = Field(default="claude")   # "claude" | "bedrock"
+
+    # ── Claude (Anthropic) ────────────────────────────────
     anthropic_api_key: str = Field(default="")
     claude_model: str = "claude-sonnet-4-20250514"
     claude_max_tokens: int = 512
     claude_timeout_seconds: int = 30
+
+    # ── AWS Bedrock (DeepSeek R1) ─────────────────────────
+    aws_access_key_id: str = Field(default="")
+    aws_secret_access_key: str = Field(default="")
+    aws_region: str = Field(default="us-east-1")
+    bedrock_model_id: str = Field(default="us.deepseek.r1-v1:0")
 
     # ── Translation ──────────────────────────────────────
     deepl_api_key: str = Field(default="")
@@ -64,7 +68,7 @@ class Settings(BaseSettings):
     # ── Rate limiting ────────────────────────────────────
     rate_limit_per_minute: int = 60
 
-    # ── Supported languages ──────────────────────────────
+    # ── Languages ────────────────────────────────────────
     supported_languages: list[str] = [
         "en", "am", "ar", "fr", "es", "pt", "sw",
         "hi", "zh", "id", "tr", "de", "ru", "ja",
@@ -99,6 +103,10 @@ class Settings(BaseSettings):
     @property
     def auth_enabled(self) -> bool:
         return bool(self.api_key)
+
+    @property
+    def use_bedrock(self) -> bool:
+        return self.ai_provider.lower() == "bedrock"
 
 
 @lru_cache

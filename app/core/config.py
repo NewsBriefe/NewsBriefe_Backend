@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     api_prefix: str = "/v1"
     allowed_origins: list[str] = []
     api_key: str = Field(default="")
+    admin_key: str = Field(default="")          # X-Admin-Key for admin endpoints
 
     # ── Database ─────────────────────────────────────────
     database_url: str = "postgresql+asyncpg://newsbrief:newsbrief@postgres:5432/newsbrief"
@@ -39,9 +40,7 @@ class Settings(BaseSettings):
     celery_result_backend: str = "redis://redis:6379/2"
 
     # ── AI Provider ───────────────────────────────────────
-    # Set AI_PROVIDER=bedrock to use AWS Bedrock DeepSeek R1
-    # Set AI_PROVIDER=claude (default) to use Anthropic Claude
-    ai_provider: str = Field(default="claude")   # "claude" | "bedrock"
+    ai_provider: str = Field(default="claude")
 
     # ── Claude (Anthropic) ────────────────────────────────
     anthropic_api_key: str = Field(default="")

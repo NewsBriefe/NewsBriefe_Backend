@@ -3,7 +3,6 @@ FastAPI Application Factory
 """
 import asyncio
 import time
-
 import sentry_sdk
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
@@ -18,8 +17,8 @@ from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 from app.core.config import get_settings
 from app.core.logging import setup_logging, get_logger
 from app.core.cache import close_redis
-from app.api.v1.endpoints.routes import router
-
+from app.api.v1.endpoints.routes import router as stories_router
+from app.api.v1.endpoints.admin import router as admin_router
 from .models.orm import HealthResponse
 
 settings = get_settings()
@@ -27,25 +26,11 @@ log = get_logger(__name__)
 
 
 async def _wait_for_db(max_retries: int = 10, delay: float = 2.0) -> None:
-    """
-    Retry the DB connection until postgres is ready.
-
-    Docker's healthcheck (pg_isready) can pass before postgres is fully
-    ready to accept connections from the network. This retry loop handles
-    that race condition cleanly instead of crashing on the first attempt.
-
-    Logs the URL being used on first attempt so connection problems
-    are immediately visible in the container logs.
-    """
     from app.core.database import engine
     from app.models.orm import Base
     from sqlalchemy import text
 
-    log.info(
-        "db_connecting",
-        url=settings.database_url,
-        max_retries=max_retries,
-    )
+    log.info("db_connecting", url=settings.database_url, max_retries=max_retries)
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -57,40 +42,23 @@ async def _wait_for_db(max_retries: int = 10, delay: float = 2.0) -> None:
             return
         except Exception as exc:
             if attempt == max_retries:
-                log.error(
-                    "db_connection_failed",
-                    url=settings.database_url,
-                    attempts=attempt,
-                    error=str(exc),
-                )
+                log.error("db_connection_failed", url=settings.database_url, attempts=attempt, error=str(exc))
                 raise
-            log.warning(
-                "db_not_ready_retrying",
-                attempt=attempt,
-                max=max_retries,
-                delay=delay,
-                error=str(exc),
-            )
+            log.warning("db_not_ready_retrying", attempt=attempt, max=max_retries, delay=delay, error=str(exc))
             await asyncio.sleep(delay)
 
 
-# ── Lifespan (startup / shutdown) ────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
     log.info("newsbrief_api_starting", version=settings.app_version, env=settings.environment)
-
     await _wait_for_db()
     log.info("db_tables_created")
-
     yield
-
-    # Shutdown
     await close_redis()
     log.info("newsbrief_api_shutdown")
 
 
-# ── Rate limiter ─────────────────────────────────────────────
 limiter = Limiter(
     key_func=get_remote_address,
     default_limits=[f"{settings.rate_limit_per_minute}/minute"],
@@ -98,7 +66,6 @@ limiter = Limiter(
 
 
 def create_app() -> FastAPI:
-    # ── Sentry (production only) ─────────────────────────
     if settings.sentry_dsn and settings.is_production:
         sentry_sdk.init(
             dsn=settings.sentry_dsn,
@@ -127,7 +94,6 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # ── CORS ─────────────────────────────────────────────
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins if settings.allowed_origins else ["*"],
@@ -136,36 +102,24 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # ── Rate limiting ─────────────────────────────────────
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-    # ── Request timing middleware ─────────────────────────
     @app.middleware("http")
     async def add_process_time(request: Request, call_next):
         start = time.perf_counter()
         response = await call_next(request)
         duration = time.perf_counter() - start
         response.headers["X-Process-Time"] = f"{duration:.4f}"
-        log.debug(
-            "request",
-            method=request.method,
-            path=request.url.path,
-            status=response.status_code,
-            duration_ms=round(duration * 1000, 1),
-        )
+        log.debug("request", method=request.method, path=request.url.path,
+         status=response.status_code, duration_ms=round(duration * 1000, 1))
         return response
 
-    # ── Error handlers ────────────────────────────────────
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={
-                "code": "validation_error",
-                "message": "Invalid request parameters",
-                "details": exc.errors(),
-            },
+            content={"code": "validation_error", "message": "Invalid request parameters", "details": exc.errors()},
         )
 
     @app.exception_handler(Exception)
@@ -173,10 +127,7 @@ def create_app() -> FastAPI:
         log.error("unhandled_exception", path=request.url.path, error=str(exc))
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "code": "internal_error",
-                "message": "An unexpected error occurred",
-            },
+            content={"code": "internal_error", "message": "An unexpected error occurred"},
         )
     # ============================================================================
     # Health & Status Endpoints
@@ -190,12 +141,10 @@ def create_app() -> FastAPI:
             version="1.0.0",
             status="operational/healthy"
         )
+    
     # ── Routes ───────────────────────────────────────────
-    app.include_router(
-        router,
-        prefix=settings.api_prefix,
-        tags=["news"],
-    )
+    app.include_router(stories_router, prefix=settings.api_prefix, tags=["news"])
+    app.include_router(admin_router,   prefix=settings.api_prefix, tags=["admin"])
 
     return app
 

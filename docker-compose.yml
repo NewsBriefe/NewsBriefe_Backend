@@ -53,9 +53,16 @@ services:
       redis:    { condition: service_healthy }
     volumes:
       - .:/app
+    # FIX: --pool=solo prevents forking entirely.f
+    # prefork (the default) forks child processes — asyncio event loops,
+    # Semaphores, and gather() deadlock silently inside forked processes.
+    # solo runs everything in a single process: no forking, asyncio works
+    # correctly, and internal gather() concurrency still works within tasks.
     command: >
       celery -A app.workers.tasks.celery_app worker
-      --loglevel=info --concurrency=2
+      --loglevel=info
+      --pool=solo
+      --concurrency=1
 
   beat:
     build: { context: ., dockerfile: Dockerfile }
@@ -68,7 +75,8 @@ services:
       - .:/app
     command: >
       celery -A app.workers.tasks.celery_app beat
-      --loglevel=info --scheduler redbeat.RedBeatScheduler
+      --loglevel=info
+      --scheduler redbeat.RedBeatScheduler
 
   flower:
     image: mher/flower:2.0

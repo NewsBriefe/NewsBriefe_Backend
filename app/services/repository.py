@@ -27,7 +27,10 @@ class ArticleRepository:
         category: str | None,
         page: int,
         per_page: int,
-        max_age_hours: int = 48,
+        # FIX: was 48 hours — articles older than 2 days were invisible even
+        # though they were still in the DB. Now matches the 7-day cleanup window
+        # so every summarised article stays visible until it is soft-deleted.
+        max_age_hours: int = 168,   # 7 days
     ) -> tuple[list[Article], int]:
         """Returns (articles, total_count)."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
@@ -37,7 +40,6 @@ class ArticleRepository:
             Article.is_summarized == True,
             Article.published_at >= cutoff,
         ]
-        # FIX #4: category arrives lowercase from routes.py — matches DB storage
         if category and category != "all":
             conditions.append(Article.category == category)
 
@@ -71,18 +73,14 @@ class ArticleRepository:
         lang: str,
         limit: int = 20,
     ) -> list[Article]:
-        """
-        Full-text search on title + summary.
-        FIX #11: now searches both title_en AND summary_en (was title-only).
-        """
+        """Full-text search on title + summary."""
         conditions = [
             Article.is_active == True,
             Article.is_summarized == True,
         ]
 
         if query:
-            ts_query = func.plainto_tsquery("english", query)
-            # FIX #11: search title AND summary, not just title
+            ts_query    = func.plainto_tsquery("english", query)
             title_vec   = func.to_tsvector("english", Article.title_en)
             summary_vec = func.to_tsvector("english", Article.summary_en)
             conditions.append(
@@ -94,7 +92,6 @@ class ArticleRepository:
 
         if country:
             conditions.append(func.lower(Article.country) == country.lower())
-        # FIX #4: category already lowercase from routes.py
         if category and category != "all":
             conditions.append(Article.category == category)
 
@@ -118,7 +115,7 @@ class ArticleRepository:
         rows = (await self._db.execute(q)).scalars().all()
         return set(rows)
 
-    async def get_unsummarized(self, limit: int = 50) -> list[Article]:
+    async def get_unsummarized(self, limit: int = 10) -> list[Article]:
         q = (
             select(Article)
             .where(Article.is_summarized == False)
@@ -143,12 +140,12 @@ class ArticleRepository:
     async def create_from_raw(self, raw: RawArticle) -> Article:
         article = Article(
             title_en=raw.title,
-            summary_en=raw.description,     # placeholder until summarized
+            summary_en=raw.description,
             source_name=raw.source_name,
             source_url=raw.source_url,
             original_url=raw.url,
             image_url=raw.image_url,
-            category=raw.category,          # already lowercase from ingestion
+            category=raw.category,
             country=raw.country,
             published_at=raw.published_at,
             fetched_at=datetime.now(timezone.utc),
@@ -161,19 +158,14 @@ class ArticleRepository:
         return article
 
     async def bulk_create_raw(self, raws: list[RawArticle]) -> list[Article]:
-        """
-        FIX #7: The original code called rollback() inside the loop, which
-        wiped every previously flushed article when a single one failed.
-        Fix: use a savepoint per article so only the failing row is rolled back.
-        """
+        """Savepoint per article — one failure never rolls back the whole batch."""
         articles = []
         for raw in raws:
             try:
-                async with self._db.begin_nested():   # savepoint
+                async with self._db.begin_nested():
                     a = await self.create_from_raw(raw)
                     articles.append(a)
             except IntegrityError:
-                # Duplicate URL/hash — silently skip, savepoint rolled back
                 log.debug("article_duplicate_skipped", url=raw.url)
             except Exception as e:
                 log.warning("article_insert_failed", url=raw.url, error=str(e))
@@ -192,9 +184,9 @@ class ArticleRepository:
         full = f"{sentence_1} {sentence_2} {sentence_3}".strip()
         article.summary_en = full
         if category:
-            article.category = category   # already lowercase from summarizer
+            article.category = category
         article.is_summarized = True
-        article.is_breaking = is_breaking
+        article.is_breaking   = is_breaking
         self._db.add(article)
         await self._db.flush()
         return article
@@ -209,7 +201,7 @@ class ArticleRepository:
     ) -> ArticleTranslation:
         existing = await self.get_translation(article_id, lang)
         if existing:
-            existing.title = title
+            existing.title   = title
             existing.summary = summary
             existing.translation_provider = provider
             self._db.add(existing)
@@ -230,36 +222,30 @@ class ArticleRepository:
 
     @staticmethod
     def localize(article: Article, lang: str) -> dict:
-        """
-        Return article fields in the requested language.
-        Falls back to English if translation doesn't exist yet.
-        Fields named to match Flutter's Story.fromJson() exactly.
-        """
+        """Return article fields in the requested language, fallback to English."""
         read_minutes = _compute_read_minutes(article.full_content_en, article.summary_en)
-        time_ago = _compute_time_ago(article.published_at)
+        time_ago     = _compute_time_ago(article.published_at)
 
         base = {
-            "id": article.id,
-            "source": article.source_name,           # Flutter reads "source"
-            "original_url": article.original_url,
-            "image_url": article.image_url,
-            "category": article.category.capitalize(), # Flutter displays "World" not "world"
-            "region": article.country,               # Flutter reads "region"
-            "published_at": article.published_at,
-            "time_ago": time_ago,                    # Flutter reads "time_ago"
-            "read_minutes": read_minutes,            # Flutter reads "read_minutes"
-            "is_breaking": article.is_breaking,      # Flutter reads "is_breaking"
+            "id":          article.id,
+            "source":      article.source_name,
+            "original_url":article.original_url,
+            "image_url":   article.image_url,
+            "category":    article.category.capitalize(),
+            "region":      article.country,
+            "published_at":article.published_at,
+            "time_ago":    time_ago,
+            "read_minutes":read_minutes,
+            "is_breaking": article.is_breaking,
         }
 
         if lang == "en" or not article.translations:
             return {**base, "title": article.title_en, "summary": article.summary_en, "language_code": "en"}
 
         translation = next(
-            (t for t in article.translations if t.language_code == lang),
-            None,
+            (t for t in article.translations if t.language_code == lang), None
         )
         if translation:
             return {**base, "title": translation.title, "summary": translation.summary, "language_code": lang}
 
-        # Fallback to English
         return {**base, "title": article.title_en, "summary": article.summary_en, "language_code": "en"}

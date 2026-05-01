@@ -2,10 +2,8 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
-    environment:
-      POSTGRES_USER: newsbrief
-      POSTGRES_PASSWORD: newsbrief
-      POSTGRES_DB: newsbrief
+    env_file:
+      - .env
     ports:
       - "5432:5432"
     volumes:
@@ -23,6 +21,8 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    # Persist data to disk every 60 seconds if at least 1 key changed
+    command: redis-server --save 60 1 --loglevel warning
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -53,16 +53,10 @@ services:
       redis:    { condition: service_healthy }
     volumes:
       - .:/app
-    # FIX: --pool=solo prevents forking entirely.f
-    # prefork (the default) forks child processes — asyncio event loops,
-    # Semaphores, and gather() deadlock silently inside forked processes.
-    # solo runs everything in a single process: no forking, asyncio works
-    # correctly, and internal gather() concurrency still works within tasks.
     command: >
       celery -A app.workers.tasks.celery_app worker
       --loglevel=info
       --pool=solo
-      --concurrency=1
 
   beat:
     build: { context: ., dockerfile: Dockerfile }

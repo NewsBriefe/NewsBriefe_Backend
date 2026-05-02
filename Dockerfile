@@ -10,7 +10,7 @@ COPY pyproject.toml .
 # Create a minimal package stub so pip can install without the full source
 RUN mkdir -p app && touch app/__init__.py
 
-RUN pip install --no-cache-dir --upgrade pip \
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir .
 
 COPY . .

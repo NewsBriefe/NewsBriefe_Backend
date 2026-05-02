@@ -1,3 +1,4 @@
+import ssl
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 from sqlalchemy import DateTime, func
@@ -11,19 +12,28 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-# ── Engine ─────────────────────────────────────────────────
-# FIX: asyncpg by default attempts an SSL handshake before plain TCP.
-# PostgreSQL in Docker does not have SSL configured, so it responds
-# with 'N' (not supported). Some asyncpg + uvloop versions misinterpret
-# this as ConnectionRefusedError instead of falling back to plain TCP.
-# ssl=False tells asyncpg to skip SSL entirely — correct for Docker.
+# ── SSL config ─────────────────────────────────────────────
+# Local Docker: ssl=False (postgres has no cert)
+# Cloud (Neon, Supabase, etc.): ssl=True (TLS required)
+# Auto-detected from DATABASE_URL:
+#   - contains "localhost" or "postgres" (Docker service) → no SSL
+#   - contains "neon.tech", "supabase", etc. → SSL
+def _needs_ssl(url: str) -> bool:
+    no_ssl_hosts = ("localhost", "@postgres:", "@127.0.0.1")
+    return not any(h in url for h in no_ssl_hosts)
+
+if _needs_ssl(settings.database_url):
+    _ssl_ctx = ssl.create_default_context()
+else:
+    _ssl_ctx = False
+
 engine = create_async_engine(
     settings.database_url,
     pool_size=settings.db_pool_size,
     max_overflow=settings.db_max_overflow,
     echo=settings.debug,
     pool_pre_ping=True,
-    connect_args={"ssl": False},
+    connect_args={"ssl": _ssl_ctx},
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -35,7 +45,6 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 
-# ── Base model with timestamps ─────────────────────────────
 class Base(DeclarativeBase):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -50,7 +59,6 @@ class Base(DeclarativeBase):
     )
 
 
-# ── Dependency ─────────────────────────────────────────────
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         try:

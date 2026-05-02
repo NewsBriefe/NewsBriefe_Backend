@@ -7,7 +7,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY pyproject.toml .
-# Create a minimal package stub so pip can install without the full source
 RUN mkdir -p app && touch app/__init__.py
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
@@ -15,8 +14,21 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
 
 COPY . .
 
-RUN useradd -m -u 1001 appuser && chown -R appuser /app
+RUN useradd -m -u 1001 appuser && chown -R appuser /app \
+    && chmod +x start_worker.sh
+
 USER appuser
 
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# SERVICE env var controls what runs:
+#   SERVICE=api    → FastAPI server  (Render)
+#   SERVICE=worker → Celery worker + beat (Back4App)
+#
+# Set SERVICE=worker in Back4App environment variables.
+# Render uses the default SERVICE=api.
+ENV SERVICE=api
+
+CMD ["sh", "-c", \
+     "if [ \"$SERVICE\" = \"worker\" ]; then /bin/bash start_worker.sh; \
+      else uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}; fi"]

@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────
+# NewsBrief — Celery Worker + Beat
+# Use this Dockerfile for Back4App (worker container).
+# The API uses the regular Dockerfile.
+# ─────────────────────────────────────────────────────────────
+
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml .
+RUN mkdir -p app && touch app/__init__.py
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir .
+
+COPY . .
+
+RUN useradd -m -u 1001 appuser && chown -R appuser /app \
+    && chmod +x start_worker.sh
+
+USER appuser
+
+# This runs both Celery worker + beat in one container
+CMD ["/bin/bash", "start_worker.sh"]

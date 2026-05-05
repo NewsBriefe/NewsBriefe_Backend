@@ -133,10 +133,9 @@ def create_app() -> FastAPI:
     # Health & Status Endpoints
     # ============================================================================
 
-    @app.get("/health", response_model=HealthResponse)
+    @app.api_route("/health", methods=["GET", "HEAD"])
     async def health_check():
-        """Health check endpoint."""
-        
+        """Health check endpoint supporting GET and HEAD requests."""
         return HealthResponse(
             version="1.0.0",
             status="operational/healthy"

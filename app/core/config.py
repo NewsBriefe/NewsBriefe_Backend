@@ -1,10 +1,16 @@
 import os
+import re
 from functools import lru_cache
 from typing import Any
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _running_in_docker = os.getenv("DOCKER", "").lower() == "true"
+
+
+def _clean_redis_url(url: str) -> str:
+    """Strip query params from Redis URL — used for Celery broker/backend."""
+    return re.sub(r'\?.*$', '', url) if url else url
 
 
 class Settings(BaseSettings):
@@ -24,7 +30,7 @@ class Settings(BaseSettings):
     api_prefix: str = "/v1"
     allowed_origins: list[str] = []
     api_key: str = Field(default="")
-    admin_key: str = Field(default="")          # X-Admin-Key for admin endpoints
+    admin_key: str = Field(default="")
 
     # ── Database ─────────────────────────────────────────
     database_url: str = "postgresql+asyncpg://newsbrief:newsbrief@postgres:5432/newsbrief"
@@ -36,19 +42,19 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = 14_400
 
     # ── Celery ────────────────────────────────────────────
-    celery_broker_url: str = "redis://redis:6379/1"
-    celery_result_backend: str = "redis://redis:6379/2"
+    celery_broker_url: str = "redis://redis:6379/0"
+    celery_result_backend: str = "redis://redis:6379/0"
 
     # ── AI Provider ───────────────────────────────────────
     ai_provider: str = Field(default="claude")
 
-    # ── Claude (Anthropic) ────────────────────────────────
+    # ── Claude ────────────────────────────────────────────
     anthropic_api_key: str = Field(default="")
     claude_model: str = "claude-sonnet-4-20250514"
     claude_max_tokens: int = 512
     claude_timeout_seconds: int = 30
 
-    # ── AWS Bedrock (DeepSeek R1) ─────────────────────────
+    # ── AWS Bedrock ───────────────────────────────────────
     aws_access_key_id: str = Field(default="")
     aws_secret_access_key: str = Field(default="")
     aws_region: str = Field(default="us-east-1")
@@ -80,7 +86,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="before")
     @classmethod
-    def _coerce_list_fields(cls, values: Any) -> Any:
+    def _coerce_fields(cls, values: Any) -> Any:
+        # Handle comma/JSON list fields
         for field in ("supported_languages", "allowed_origins"):
             v = values.get(field)
             if isinstance(v, str):
@@ -89,6 +96,15 @@ class Settings(BaseSettings):
                     values[field] = json.loads(v)
                 except (json.JSONDecodeError, ValueError):
                     values[field] = [x.strip() for x in v.split(",") if x.strip()]
+
+        # Strip ?ssl_cert_reqs=... from Celery broker/backend URLs.
+        # Celery passes them directly to redis-py which rejects them as kwargs.
+        # The actual SSL is handled by the rediss:// scheme automatically.
+        for field in ("celery_broker_url", "celery_result_backend"):
+            v = values.get(field)
+            if isinstance(v, str):
+                values[field] = _clean_redis_url(v)
+
         return values
 
     @property

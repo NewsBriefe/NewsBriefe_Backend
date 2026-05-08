@@ -1,18 +1,8 @@
 """
 Celery Workers — background task pipeline
-
-POOL: solo (--pool=solo --concurrency=1)
-  prefork forks child processes. asyncio event loops, Semaphores, and
-  asyncio.gather() deadlock silently inside forked processes — tasks are
-  received but never execute, and the same task re-queues indefinitely.
-  solo runs everything in one process: no forking, asyncio works correctly.
-  Internal asyncio.gather() concurrency still works fine within each task.
-
-BATCH: 10 articles per summarize run (runs every 15 min → 40/hour)
-CONCURRENCY: 3 articles processed simultaneously inside each task
-PER-ARTICLE TIMEOUT: 45s for summarization, 20s per translation
 """
 import asyncio
+import ssl
 from datetime import datetime, timedelta, timezone
 from celery import Celery
 from celery.schedules import crontab
@@ -21,6 +11,23 @@ from app.core.logging import get_logger, setup_logging
 
 settings = get_settings()
 log = get_logger(__name__)
+
+# ── SSL config for Upstash (rediss://) ───────────────────────
+# Celery's Redis backend requires ssl_cert_reqs to be passed via
+# broker_transport_options — NOT in the URL string.
+# This is separate from the redis.asyncio client in cache.py.
+def _celery_redis_ssl_options() -> dict:
+    url = settings.celery_broker_url
+    if url.startswith("rediss://"):
+        return {
+            "ssl_cert_reqs": ssl.CERT_NONE,
+            "ssl_ca_certs": None,
+            "ssl_certfile": None,
+            "ssl_keyfile": None,
+        }
+    return {}
+
+_ssl_opts = _celery_redis_ssl_options()
 
 celery_app = Celery(
     "newsbrief",
@@ -35,13 +42,16 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_track_started=True,
-    # FIX: removed task_acks_late=True — with solo pool and no forking,
-    # late acks only cause duplicate task delivery when tasks take > broker timeout
-    task_acks_late=False,
+    task_acks_late=True,
     worker_prefetch_multiplier=1,
     broker_connection_retry_on_startup=True,
     beat_scheduler="redbeat.RedBeatScheduler",
     redbeat_redis_url=settings.celery_broker_url,
+
+    # SSL options for Upstash — applied to both broker and backend
+    broker_transport_options={"ssl": _ssl_opts} if _ssl_opts else {},
+    redis_backend_use_ssl=_ssl_opts if _ssl_opts else None,
+
     beat_schedule={
         "fetch-news-every-4h": {
             "task": "app.workers.tasks.fetch_and_process_news",
@@ -60,17 +70,12 @@ celery_app.conf.update(
 
 
 def run_async(coro):
-    """
-    Run an async coroutine from a sync Celery task.
-    Safe with --pool=solo because there is no forking.
-    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
         loop.close()
-        asyncio.set_event_loop(None)
 
 
 def _get_summarizer():
@@ -127,10 +132,8 @@ def fetch_and_process_news(self):
 
 @celery_app.task(
     name="app.workers.tasks.summarize_pending",
-    bind=True,
-    max_retries=2,
-    soft_time_limit=480,
-    time_limit=540,
+    bind=True, max_retries=2,
+    soft_time_limit=480, time_limit=540,
 )
 def summarize_pending(self):
     setup_logging()
@@ -162,26 +165,25 @@ async def _fetch_and_process() -> dict:
     start = datetime.now(timezone.utc)
     async with AsyncSessionLocal() as db:
         repo = ArticleRepository(db)
-
         rss_articles = await RSSFetcher().fetch_all()
         api_articles = await NewsAPIFetcher().fetch_top_headlines()
-        all_raw      = rss_articles + api_articles
+        all_raw = rss_articles + api_articles
         log.info("raw_fetched", rss=len(rss_articles), api=len(api_articles))
 
         existing_urls   = await repo.get_existing_urls()
         existing_hashes = await repo.get_existing_hashes()
-        unique, duped   = Deduplicator(existing_hashes, existing_urls).filter(all_raw)
-        saved           = await repo.bulk_create_raw(unique)
+        unique, duped_count = Deduplicator(existing_hashes, existing_urls).filter(all_raw)
+        saved = await repo.bulk_create_raw(unique)
 
         db.add(FetchLog(
             source="all",
             articles_fetched=len(all_raw),
             articles_new=len(saved),
-            articles_duped=duped,
+            articles_duped=duped_count,
             duration_seconds=(datetime.now(timezone.utc) - start).total_seconds(),
         ))
         await db.commit()
-        return {"fetched": len(all_raw), "new": len(saved), "duped": duped}
+        return {"fetched": len(all_raw), "new": len(saved), "duped": duped_count}
 
 
 async def _summarize_pending() -> dict:
@@ -193,85 +195,82 @@ async def _summarize_pending() -> dict:
     BATCH_SIZE     = 10
     CONCURRENCY    = 3
     PRIORITY_LANGS = ["ar", "fr", "es", "pt", "sw", "hi", "zh", "id", "th", "vi"]
+    ARTICLE_TIMEOUT = 45
 
     summarizer = _get_summarizer()
     translator = TranslationService()
     summarized = 0
     translated = 0
-    sem        = asyncio.Semaphore(CONCURRENCY)
+    sem = asyncio.Semaphore(CONCURRENCY)
 
-    async def process_one(article) -> tuple[bool, int]:
+    async def process_one(article, db, repo) -> tuple[bool, int]:
         async with sem:
             try:
-                content = article.full_content_en or article.summary_en or article.title_en
-
-                summary = await asyncio.wait_for(
-                    summarizer.summarize(article.title_en, content), timeout=45
-                )
+                content  = article.full_content_en or article.summary_en or article.title_en
+                summary  = await asyncio.wait_for(
+                    summarizer.summarize(article.title_en, content), timeout=ARTICLE_TIMEOUT)
                 category = await asyncio.wait_for(
-                    summarizer.categorize(article.title_en, article.summary_en), timeout=15
-                )
+                    summarizer.categorize(article.title_en, article.summary_en), timeout=15)
                 is_breaking = _detect_breaking(
-                    article.title_en, article.source_name, article.published_at
+                    article.title_en, article.source_name, article.published_at)
+
+                await repo.update_summary(
+                    article,
+                    sentence_1=summary.sentence_1,
+                    sentence_2=summary.sentence_2,
+                    sentence_3=summary.sentence_3,
+                    category=category,
+                    is_breaking=is_breaking,
                 )
 
-                # Use a fresh DB session per article to avoid shared-state issues
-                async with AsyncSessionLocal() as db:
-                    repo = ArticleRepository(db)
-                    await repo.update_summary(
-                        article, summary.sentence_1, summary.sentence_2,
-                        summary.sentence_3, category, is_breaking,
-                    )
-                    t_count = 0
-                    for lang in PRIORITY_LANGS:
-                        if await repo.get_translation(article.id, lang):
-                            continue
-                        try:
-                            t_title, t_summary = await asyncio.wait_for(
-                                translator.translate_pair(article.title_en, summary.full, lang),
-                                timeout=20,
-                            )
-                            await repo.upsert_translation(
-                                article.id, lang, t_title, t_summary,
-                                TranslationService.provider_name(lang),
-                            )
-                            t_count += 1
-                        except asyncio.TimeoutError:
-                            log.warning("translation_timeout", lang=lang, id=article.id)
-                        except Exception as e:
-                            log.warning("translation_failed", lang=lang, error=str(e))
-                    await db.commit()
+                t_count = 0
+                for lang in PRIORITY_LANGS:
+                    if await repo.get_translation(article.id, lang):
+                        continue
+                    try:
+                        t_title, t_summary = await asyncio.wait_for(
+                            translator.translate_pair(article.title_en, summary.full, lang),
+                            timeout=20)
+                        await repo.upsert_translation(
+                            article.id, lang, t_title, t_summary,
+                            TranslationService.provider_name(lang))
+                        t_count += 1
+                    except asyncio.TimeoutError:
+                        log.warning("translation_timeout", lang=lang)
+                    except Exception as e:
+                        log.warning("pre_translate_failed", lang=lang, error=str(e))
 
-                log.info("article_summarized",
-                         id=article.id, category=category, breaking=is_breaking)
+                await db.commit()
+                log.info("article_summarized", id=article.id, category=category)
                 return True, t_count
 
             except asyncio.TimeoutError:
-                log.warning("article_timeout", id=article.id)
+                log.warning("article_summarize_timeout", id=article.id)
+                await db.rollback()
                 return False, 0
             except Exception as e:
-                log.error("article_failed", id=article.id, error=str(e))
+                log.error("summarize_article_failed", id=article.id, error=str(e))
+                await db.rollback()
                 return False, 0
 
-    # Fetch pending articles
     async with AsyncSessionLocal() as db:
         repo     = ArticleRepository(db)
         articles = await repo.get_unsummarized(limit=BATCH_SIZE)
+        log.info("summarize_batch_start", count=len(articles))
 
-    if not articles:
-        log.info("no_pending_articles")
-        return {"summarized": 0, "translated": 0}
+        if not articles:
+            log.info("no_pending_articles")
+            return {"summarized": 0, "translated": 0}
 
-    log.info("summarize_batch_start", count=len(articles))
+        results = await asyncio.gather(
+            *[process_one(a, db, repo) for a in articles],
+            return_exceptions=False,
+        )
+        for success, t_count in results:
+            if success:
+                summarized += 1
+                translated += t_count
 
-    results = await asyncio.gather(*[process_one(a) for a in articles])
-
-    for ok, t_count in results:
-        if ok:
-            summarized += 1
-            translated += t_count
-
-    # Bust story cache
     try:
         redis   = await get_redis()
         deleted = await CacheClient(redis).delete_pattern("stories:*")

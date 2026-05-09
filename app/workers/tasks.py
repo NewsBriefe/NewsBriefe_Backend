@@ -192,8 +192,8 @@ async def _summarize_pending() -> dict:
     from app.services.repository import ArticleRepository
     from app.services.translator import TranslationService
 
-    BATCH_SIZE     = 10
-    CONCURRENCY    = 3
+    BATCH_SIZE     = 5
+    CONCURRENCY    = 1
     PRIORITY_LANGS = ["ar", "fr", "es", "pt", "sw", "hi", "zh", "id", "th", "vi"]
     ARTICLE_TIMEOUT = 45
 

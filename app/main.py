@@ -19,6 +19,7 @@ from app.core.logging import setup_logging, get_logger
 from app.core.cache import close_redis
 from app.api.v1.endpoints.routes import router as stories_router
 from app.api.v1.endpoints.admin import router as admin_router
+from app.api.v1.endpoints.subscribers import router as subscribers_router
 from .models.orm import HealthResponse
 
 settings = get_settings()
@@ -28,6 +29,7 @@ log = get_logger(__name__)
 async def _wait_for_db(max_retries: int = 10, delay: float = 2.0) -> None:
     from app.core.database import engine
     from app.models.orm import Base
+    from app.models.subscriber import Subscriber  # ensure table is registered
     from sqlalchemy import text
 
     log.info("db_connecting", url=settings.database_url, max_retries=max_retries)
@@ -88,8 +90,8 @@ def create_app() -> FastAPI:
             "- Deduplicated from 12+ RSS sources + NewsAPI\n"
             "- 4-hour cache refresh cycle\n"
         ),
-        docs_url="/docs" if not settings.is_production else None,
-        redoc_url="/redoc" if not settings.is_production else None,
+        docs_url="/docs"    if not settings.is_production else None,
+        redoc_url="/redoc"  if not settings.is_production else None,
         openapi_url="/openapi.json" if not settings.is_production else None,
         lifespan=lifespan,
     )
@@ -98,7 +100,7 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=settings.allowed_origins if settings.allowed_origins else ["*"],
         allow_credentials=True,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["*"],
     )
 
@@ -107,19 +109,33 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def add_process_time(request: Request, call_next):
-        start = time.perf_counter()
+        start    = time.perf_counter()
         response = await call_next(request)
         duration = time.perf_counter() - start
         response.headers["X-Process-Time"] = f"{duration:.4f}"
         log.debug("request", method=request.method, path=request.url.path,
-         status=response.status_code, duration_ms=round(duration * 1000, 1))
+                  status=response.status_code, duration_ms=round(duration * 1000, 1))
         return response
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
+        # Clean up the error details to make them JSON serializable
+        clean_errors = []
+        for error in exc.errors():
+            clean_error = {
+                "field": ".".join(str(loc) for loc in error["loc"]),
+                "message": error["msg"],
+                "type": error["type"],
+            }
+            clean_errors.append(clean_error)
+        
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"code": "validation_error", "message": "Invalid request parameters", "details": exc.errors()},
+            content={
+                "code": "validation_error", 
+                "message": "Invalid request parameters", 
+                "details": clean_errors
+            },
         )
 
     @app.exception_handler(Exception)
@@ -142,8 +158,9 @@ def create_app() -> FastAPI:
         )
     
     # ── Routes ───────────────────────────────────────────
-    app.include_router(stories_router, prefix=settings.api_prefix, tags=["news"])
-    app.include_router(admin_router,   prefix=settings.api_prefix, tags=["admin"])
+    app.include_router(stories_router,    prefix=settings.api_prefix, tags=["news"])
+    app.include_router(admin_router,      prefix=settings.api_prefix, tags=["admin"])
+    app.include_router(subscribers_router, prefix=settings.api_prefix, tags=["subscribe"])
 
     return app
 

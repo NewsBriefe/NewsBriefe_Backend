@@ -12,6 +12,8 @@ RUN mkdir -p app && touch app/__init__.py
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir .
 
+RUN pip install email-validator
+
 COPY . .
 
 RUN useradd -m -u 1001 appuser && chown -R appuser /app \

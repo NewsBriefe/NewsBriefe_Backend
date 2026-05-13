@@ -19,7 +19,7 @@ primary_region = "iad"   # Change to closest: iad=US-East, lax=US-West, lhr=Lond
 
 [[vm]]
   size   = "shared-cpu-1x"   # Free tier — 1 shared vCPU
-  memory = "256mb"            # Free tier — 256MB RAM
+  memory = "512mb"            # Free tier — 256MB RAM
 
 # Health check — uses the tiny HTTP server in start_worker.sh
 [http_service]

@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     max_articles_per_fetch: int = 100
     dedup_similarity_threshold: float = 0.75
 
+    # ── Token-optimization feature flags ──────────────────
+    # Stage 2 of dedup: semantic embedding similarity (catches
+    # different wording, same event). Stage 1 (Jaccard word-overlap)
+    # always runs since it's free. Disable this if you want to skip
+    # the fastembed model load entirely (e.g. very constrained envs).
+    semantic_dedup_enabled: bool = Field(default=True)
+    semantic_dedup_threshold: float = Field(default=0.86)
+    max_daily_summaries: int = Field(default=200)
+
     # ── Rate limiting ────────────────────────────────────
     rate_limit_per_minute: int = 60
 
@@ -87,7 +96,6 @@ class Settings(BaseSettings):
     @model_validator(mode="before")
     @classmethod
     def _coerce_fields(cls, values: Any) -> Any:
-        # Handle comma/JSON list fields
         for field in ("supported_languages", "allowed_origins"):
             v = values.get(field)
             if isinstance(v, str):
@@ -97,9 +105,6 @@ class Settings(BaseSettings):
                 except (json.JSONDecodeError, ValueError):
                     values[field] = [x.strip() for x in v.split(",") if x.strip()]
 
-        # Strip ?ssl_cert_reqs=... from Celery broker/backend URLs.
-        # Celery passes them directly to redis-py which rejects them as kwargs.
-        # The actual SSL is handled by the rediss:// scheme automatically.
         for field in ("celery_broker_url", "celery_result_backend"):
             v = values.get(field)
             if isinstance(v, str):

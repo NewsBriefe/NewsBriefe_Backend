@@ -114,7 +114,7 @@ class BedrockSummarizationService:
 
     async def summarize(self, title: str, content: str) -> Summary:
         import asyncio
-        truncated = self._truncate(content, max_words=3000)
+        truncated = self._truncate(content, max_words=400)
         prompt = SUMMARIZE_PROMPT.format(title=title, content=truncated)
         try:
             raw = await asyncio.to_thread(self._invoke, prompt, max_tokens=600)
@@ -125,6 +125,13 @@ class BedrockSummarizationService:
 
     async def categorize(self, title: str, snippet: str) -> str:
         import asyncio
+        # FIX: heuristic-first categorization — only call Bedrock when the
+        # keyword heuristic has no confident match (returns "world" default).
+        # Saves one full AI call per article in most cases.
+        heuristic = self._heuristic_category(title)
+        if heuristic != "world":
+            return heuristic
+
         valid = {"world", "science", "business", "health", "tech", "sports", "climate", "arts"}
         prompt = CATEGORIZE_PROMPT.format(title=title, snippet=snippet[:400])
         try:
@@ -133,7 +140,7 @@ class BedrockSummarizationService:
             return cat if cat in valid else "world"
         except Exception as e:
             log.warning("bedrock_categorize_failed", error=str(e))
-            return self._heuristic_category(title)
+            return heuristic
 
     async def summarize_batch(self, articles: list[tuple[str, str]]) -> list[Summary]:
         results = []

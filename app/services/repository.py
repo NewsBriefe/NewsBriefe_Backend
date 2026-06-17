@@ -1,6 +1,9 @@
 """
 Article Repository — all database queries live here.
-The API layer never writes raw SQL.
+
+NEW METHODS for token optimization (Phase B — dedup):
+  get_recent_summarized_titles()  — recent titles for similarity check
+  find_similar_summarized()       — fetch the matching article to reuse its summary
 """
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, func, and_, or_, desc
@@ -8,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import IntegrityError
 from app.models.orm import Article, ArticleTranslation
-from app.models.schemas import StoryOut, StoryDetailOut, _compute_time_ago, _compute_read_minutes
+from app.models.schemas import _compute_time_ago, _compute_read_minutes
 from app.services.ingestion import RawArticle
 from app.core.logging import get_logger
 
@@ -22,19 +25,10 @@ class ArticleRepository:
     # ── Read ─────────────────────────────────────────────────
 
     async def get_top_stories(
-        self,
-        lang: str,
-        category: str | None,
-        page: int,
-        per_page: int,
-        # FIX: was 48 hours — articles older than 2 days were invisible even
-        # though they were still in the DB. Now matches the 7-day cleanup window
-        # so every summarised article stays visible until it is soft-deleted.
-        max_age_hours: int = 168,   # 7 days
+        self, lang: str, category: str | None, page: int, per_page: int,
+        max_age_hours: int = 168,
     ) -> tuple[list[Article], int]:
-        """Returns (articles, total_count)."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
-
         conditions = [
             Article.is_active == True,
             Article.is_summarized == True,
@@ -66,30 +60,15 @@ class ArticleRepository:
         return (await self._db.execute(q)).scalar_one_or_none()
 
     async def search(
-        self,
-        query: str,
-        country: str | None,
-        category: str | None,
-        lang: str,
-        limit: int = 20,
+        self, query: str, country: str | None, category: str | None,
+        lang: str, limit: int = 20,
     ) -> list[Article]:
-        """Full-text search on title + summary."""
-        conditions = [
-            Article.is_active == True,
-            Article.is_summarized == True,
-        ]
-
+        conditions = [Article.is_active == True, Article.is_summarized == True]
         if query:
             ts_query    = func.plainto_tsquery("english", query)
             title_vec   = func.to_tsvector("english", Article.title_en)
             summary_vec = func.to_tsvector("english", Article.summary_en)
-            conditions.append(
-                or_(
-                    title_vec.op("@@")(ts_query),
-                    summary_vec.op("@@")(ts_query),
-                )
-            )
-
+            conditions.append(or_(title_vec.op("@@")(ts_query), summary_vec.op("@@")(ts_query)))
         if country:
             conditions.append(func.lower(Article.country) == country.lower())
         if category and category != "all":
@@ -107,15 +86,13 @@ class ArticleRepository:
 
     async def get_existing_urls(self) -> set[str]:
         q = select(Article.original_url)
-        rows = (await self._db.execute(q)).scalars().all()
-        return set(rows)
+        return set((await self._db.execute(q)).scalars().all())
 
     async def get_existing_hashes(self) -> set[str]:
         q = select(Article.content_hash).where(Article.content_hash.is_not(None))
-        rows = (await self._db.execute(q)).scalars().all()
-        return set(rows)
+        return set((await self._db.execute(q)).scalars().all())
 
-    async def get_unsummarized(self, limit: int = 10) -> list[Article]:
+    async def get_unsummarized(self, limit: int = 100) -> list[Article]:
         q = (
             select(Article)
             .where(Article.is_summarized == False)
@@ -124,14 +101,29 @@ class ArticleRepository:
         )
         return list((await self._db.execute(q)).scalars().all())
 
-    async def get_translation(
-        self, article_id: str, lang: str
-    ) -> ArticleTranslation | None:
+    async def get_recent_summarized_titles(self, hours: int = 6) -> list[str]:
+        """
+        Phase B dedup: titles of articles summarized in the last N hours.
+        Used to detect when a new article covers the same event as one
+        already summarized — avoids a duplicate Bedrock call.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        q = (
+            select(Article.title_en)
+            .where(Article.is_summarized == True, Article.fetched_at >= cutoff)
+            .order_by(desc(Article.fetched_at))
+            .limit(200)
+        )
+        return list((await self._db.execute(q)).scalars().all())
+
+    async def find_similar_summarized(self, title: str) -> Article | None:
+        """Fetch the full article matching a title from get_recent_summarized_titles()."""
+        q = select(Article).where(Article.title_en == title, Article.is_summarized == True)
+        return (await self._db.execute(q)).scalar_one_or_none()
+
+    async def get_translation(self, article_id: str, lang: str) -> ArticleTranslation | None:
         q = select(ArticleTranslation).where(
-            and_(
-                ArticleTranslation.article_id == article_id,
-                ArticleTranslation.language_code == lang,
-            )
+            and_(ArticleTranslation.article_id == article_id, ArticleTranslation.language_code == lang)
         )
         return (await self._db.execute(q)).scalar_one_or_none()
 
@@ -139,32 +131,23 @@ class ArticleRepository:
 
     async def create_from_raw(self, raw: RawArticle) -> Article:
         article = Article(
-            title_en=raw.title,
-            summary_en=raw.description,
-            source_name=raw.source_name,
-            source_url=raw.source_url,
-            original_url=raw.url,
-            image_url=raw.image_url,
-            category=raw.category,
-            country=raw.country,
-            published_at=raw.published_at,
-            fetched_at=datetime.now(timezone.utc),
-            content_hash=raw.content_hash,
-            is_summarized=False,
-            is_breaking=False,
+            title_en=raw.title, summary_en=raw.description,
+            source_name=raw.source_name, source_url=raw.source_url,
+            original_url=raw.url, image_url=raw.image_url,
+            category=raw.category, country=raw.country,
+            published_at=raw.published_at, fetched_at=datetime.now(timezone.utc),
+            content_hash=raw.content_hash, is_summarized=False, is_breaking=False,
         )
         self._db.add(article)
         await self._db.flush()
         return article
 
     async def bulk_create_raw(self, raws: list[RawArticle]) -> list[Article]:
-        """Savepoint per article — one failure never rolls back the whole batch."""
         articles = []
         for raw in raws:
             try:
                 async with self._db.begin_nested():
-                    a = await self.create_from_raw(raw)
-                    articles.append(a)
+                    articles.append(await self.create_from_raw(raw))
             except IntegrityError:
                 log.debug("article_duplicate_skipped", url=raw.url)
             except Exception as e:
@@ -173,13 +156,8 @@ class ArticleRepository:
         return articles
 
     async def update_summary(
-        self,
-        article: Article,
-        sentence_1: str,
-        sentence_2: str,
-        sentence_3: str,
-        category: str | None = None,
-        is_breaking: bool = False,
+        self, article: Article, sentence_1: str, sentence_2: str, sentence_3: str,
+        category: str | None = None, is_breaking: bool = False,
     ) -> Article:
         full = f"{sentence_1} {sentence_2} {sentence_3}".strip()
         article.summary_en = full
@@ -192,27 +170,16 @@ class ArticleRepository:
         return article
 
     async def upsert_translation(
-        self,
-        article_id: str,
-        lang: str,
-        title: str,
-        summary: str,
-        provider: str,
+        self, article_id: str, lang: str, title: str, summary: str, provider: str,
     ) -> ArticleTranslation:
         existing = await self.get_translation(article_id, lang)
         if existing:
-            existing.title   = title
-            existing.summary = summary
-            existing.translation_provider = provider
+            existing.title, existing.summary, existing.translation_provider = title, summary, provider
             self._db.add(existing)
             return existing
-
         translation = ArticleTranslation(
-            article_id=article_id,
-            language_code=lang,
-            title=title,
-            summary=summary,
-            translation_provider=provider,
+            article_id=article_id, language_code=lang,
+            title=title, summary=summary, translation_provider=provider,
         )
         self._db.add(translation)
         await self._db.flush()
@@ -222,30 +189,18 @@ class ArticleRepository:
 
     @staticmethod
     def localize(article: Article, lang: str) -> dict:
-        """Return article fields in the requested language, fallback to English."""
         read_minutes = _compute_read_minutes(article.full_content_en, article.summary_en)
         time_ago     = _compute_time_ago(article.published_at)
-
         base = {
-            "id":          article.id,
-            "source":      article.source_name,
-            "original_url":article.original_url,
-            "image_url":   article.image_url,
-            "category":    article.category.capitalize(),
-            "region":      article.country,
-            "published_at":article.published_at,
-            "time_ago":    time_ago,
-            "read_minutes":read_minutes,
-            "is_breaking": article.is_breaking,
+            "id": article.id, "source": article.source_name,
+            "original_url": article.original_url, "image_url": article.image_url,
+            "category": article.category.capitalize(), "region": article.country,
+            "published_at": article.published_at, "time_ago": time_ago,
+            "read_minutes": read_minutes, "is_breaking": article.is_breaking,
         }
-
         if lang == "en" or not article.translations:
             return {**base, "title": article.title_en, "summary": article.summary_en, "language_code": "en"}
-
-        translation = next(
-            (t for t in article.translations if t.language_code == lang), None
-        )
+        translation = next((t for t in article.translations if t.language_code == lang), None)
         if translation:
             return {**base, "title": translation.title, "summary": translation.summary, "language_code": lang}
-
         return {**base, "title": article.title_en, "summary": article.summary_en, "language_code": "en"}

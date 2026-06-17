@@ -21,8 +21,14 @@ dependencies = [
     "celery-redbeat==2.2.0",
 
     # ── AI providers ───────────────────────────────────────
-    "anthropic==0.49.0",            # updated — supports claude-sonnet-4
+    "anthropic==0.49.0",
     "boto3==1.38.0",                # AWS Bedrock (DeepSeek R1)
+
+    # ── Semantic similarity for dedup ───────────────────────
+    # fastembed runs on ONNX Runtime, not PyTorch — same embedding
+    # quality as sentence-transformers at a fraction of the install
+    # size and no CUDA bloat. Used only for title-similarity dedup.
+    "fastembed==0.3.6",
 
     # ── Translation ────────────────────────────────────────
     "deepl==1.19.1",
@@ -32,10 +38,13 @@ dependencies = [
     "feedparser==6.0.11",
     "newsapi-python==0.2.7",
 
-    # ── NLP / deduplication ────────────────────────────────
+    # ── NLP ──────────────────────────────────────────────────
     "langdetect==1.0.9",
-    "scikit-learn==1.5.2",
-    "numpy==2.1.3",
+    # NOTE: scikit-learn removed — TF-IDF dedup was replaced with
+    # URL+hash dedup (ingestion) and Jaccard+embedding dedup (tasks)
+    # to fix OOM on memory-constrained workers. numpy stays since
+    # fastembed depends on it transitively.
+    "numpy<2",
 
     # ── Config & validation ────────────────────────────────
     "pydantic==2.10.2",

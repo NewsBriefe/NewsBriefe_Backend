@@ -275,7 +275,7 @@ async def _summarize_pending() -> dict:
     TOP_N                = 30
     CONCURRENCY          = 1
     ARTICLE_TIMEOUT       = 45
-    MIN_WORDS             = 80
+    MIN_WORDS             = 20
     JACCARD_THRESHOLD     = 0.55
     SEMANTIC_THRESHOLD    = settings.semantic_dedup_threshold
 

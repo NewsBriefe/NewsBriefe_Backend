@@ -15,6 +15,10 @@ OPTIMIZATIONS ACTIVE:
   C1. Article ranking — score by recency + source quality + breaking flag
   C2. Top-N selection — summarize only top 30 per run
   C3. Daily budget cap — hard limit on Bedrock calls per day
+  ############################################################################
+All tuning constants are now read from Redis feature flags at runtime.
+Change them via POST /v1/admin/flags — takes effect on next task run,
+no worker restart needed.
 """
 import asyncio
 import hashlib
@@ -35,12 +39,16 @@ log = get_logger(__name__)
 def _celery_ssl() -> dict:
     if settings.celery_broker_url.startswith("rediss://"):
         return {"ssl_cert_reqs": ssl.CERT_NONE, "ssl_ca_certs": None,
-                 "ssl_certfile": None, "ssl_keyfile": None}
+                "ssl_certfile": None, "ssl_keyfile": None}
     return {}
 
 _ssl = _celery_ssl()
 
-celery_app = Celery("newsbrief", broker=settings.celery_broker_url, backend=settings.celery_result_backend)
+celery_app = Celery(
+    "newsbrief",
+    broker=settings.celery_broker_url,
+    backend=settings.celery_result_backend,
+)
 celery_app.conf.update(
     task_serializer="json", result_serializer="json", accept_content=["json"],
     timezone="UTC", enable_utc=True, task_track_started=True,
@@ -100,7 +108,7 @@ def _detect_breaking(title: str, source: str, published_at: datetime) -> bool:
     return any(kw in title.lower() for kw in _BREAKING_KW) or source in _BREAKING_SRC
 
 
-# ── C1: Article ranking ───────────────────────────────────────
+# ── Article ranking ───────────────────────────────────────────
 
 _SOURCE_SCORES = {
     "Reuters": 10, "AP News": 10, "Associated Press": 10, "AFP": 10,
@@ -122,10 +130,11 @@ def _rank_article(article) -> float:
     return recency + source + breaking
 
 
-# ── B1 Stage 1: Jaccard title similarity (free, no model) ────
+# ── Title similarity (Jaccard) ────────────────────────────────
 
-_STOPWORDS = {"the","a","an","in","on","at","to","for","of","and","or","is","are",
-              "was","were","by","with","as","its","it","this","that","from","has","have"}
+_STOPWORDS = {"the","a","an","in","on","at","to","for","of","and","or","is",
+              "are","was","were","by","with","as","its","it","this","that",
+              "from","has","have"}
 
 def _title_similarity(t1: str, t2: str) -> float:
     def words(t):
@@ -148,33 +157,31 @@ async def _batch_get_embeddings(redis, texts: list[str]) -> dict[str, list[float
     """
     if not texts:
         return {}
-    unique_texts = list(dict.fromkeys(texts))  # dedupe, preserve order
-    keys = [f"embedding:{hashlib.sha256(t.encode()).hexdigest()[:16]}" for t in unique_texts]
+    unique = list(dict.fromkeys(texts))  # dedupe, preserve order
+    keys = [f"embedding:{hashlib.sha256(t.encode()).hexdigest()[:16]}" for t in unique]
 
     cached = await redis.mget(keys)
     result: dict[str, list[float]] = {}
     missing_texts, missing_keys = [], []
-    for t, k, c in zip(unique_texts, keys, cached):
+    for t, k, c in zip(unique, keys, cached):
         if c:
             result[t] = json.loads(c)
         else:
             missing_texts.append(t)
             missing_keys.append(k)
-
     if missing_texts:
         from app.services.embeddings import EmbeddingService
         embeddings = EmbeddingService.embed_batch(missing_texts)
         pipe = redis.pipeline()
         for t, k, emb in zip(missing_texts, missing_keys, embeddings):
             result[t] = emb
-            pipe.setex(k, 86400, json.dumps(emb))  # 24h TTL
+            pipe.setex(k, 86400, json.dumps(emb))
         await pipe.execute()
-
     return result
 
 
 def _best_semantic_match(
-    title: str, recent_titles: list[str], embeddings_map: dict[str, list[float]]
+    title: str, recent_titles: list[str], embeddings_map: dict
 ) -> tuple[str | None, float]:
     from app.services.embeddings import EmbeddingService
     new_emb = embeddings_map.get(title)
@@ -189,6 +196,25 @@ def _best_semantic_match(
         if sim > best_sim:
             best_sim, best_title = sim, rt
     return best_title, best_sim
+
+
+def _heuristic_cat(title: str) -> str:
+    t = title.lower()
+    if any(w in t for w in ["health","disease","vaccine","hospital","cancer","covid","drug","medical"]):
+        return "health"
+    if any(w in t for w in ["climate","carbon","emissions","renewable","drought","flood","wildfire"]):
+        return "climate"
+    if any(w in t for w in ["football","soccer","basketball","tennis","olympic","sport","nba","nfl","fifa"]):
+        return "sports"
+    if any(w in t for w in ["science","research","nasa","space","biology","physics"]):
+        return "science"
+    if any(w in t for w in ["economy","stock","gdp","trade","market","bank","inflation"]):
+        return "business"
+    if any(w in t for w in ["ai","tech","software","apple","google","chip","cyber","robot","startup"]):
+        return "tech"
+    if any(w in t for w in ["art","music","film","movie","culture","book","oscar"]):
+        return "arts"
+    return "world"
 
 
 # ── Tasks ─────────────────────────────────────────────────────
@@ -238,22 +264,28 @@ def cleanup_old_articles():
 
 async def _fetch_and_process() -> dict:
     from app.core.database import AsyncSessionLocal
+    from app.core.flags import get_flags
     from app.services.ingestion import RSSFetcher, NewsAPIFetcher, Deduplicator
     from app.services.repository import ArticleRepository
     from app.models.orm import FetchLog
 
+    flags = await get_flags()
+    if not flags["fetch_enabled"]:
+        log.info("fetch_disabled_by_flag")
+        return {"fetched": 0, "new": 0, "duped": 0, "disabled": True}
+
     start = datetime.now(timezone.utc)
     async with AsyncSessionLocal() as db:
-        repo = ArticleRepository(db)
-        rss  = await RSSFetcher().fetch_all()
-        api  = await NewsAPIFetcher().fetch_top_headlines()
+        repo    = ArticleRepository(db)
+        rss     = await RSSFetcher().fetch_all()
+        api     = await NewsAPIFetcher().fetch_top_headlines()
         all_raw = rss + api
         log.info("raw_fetched", rss=len(rss), api=len(api))
 
         existing_urls   = await repo.get_existing_urls()
         existing_hashes = await repo.get_existing_hashes()
-        unique, duped = Deduplicator(existing_hashes, existing_urls).filter(all_raw)
-        saved = await repo.bulk_create_raw(unique)
+        unique, duped   = Deduplicator(existing_hashes, existing_urls).filter(all_raw)
+        saved           = await repo.bulk_create_raw(unique)
 
         db.add(FetchLog(
             source="all",
@@ -263,37 +295,48 @@ async def _fetch_and_process() -> dict:
             duration_seconds=(datetime.now(timezone.utc) - start).total_seconds(),
         ))
         await db.commit()
-        return {"fetched": len(all_raw), "new": len(saved), "duped": duped}
+    return {"fetched": len(all_raw), "new": len(saved), "duped": duped}
 
 
 async def _summarize_pending() -> dict:
     from app.core.database import AsyncSessionLocal
     from app.core.cache import get_redis, CacheClient
+    from app.core.flags import get_flags
     from app.services.repository import ArticleRepository
-
-    MAX_DAILY_SUMMARIES  = settings.max_daily_summaries
-    TOP_N                = 30
-    CONCURRENCY          = 1
-    ARTICLE_TIMEOUT       = 45
-    MIN_WORDS             = 20
-    JACCARD_THRESHOLD     = 0.55
-    SEMANTIC_THRESHOLD    = settings.semantic_dedup_threshold
 
     redis = await get_redis()
     cache = CacheClient(redis)
 
-    today       = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    budget_key  = f"daily_summaries:{today}"
+    # ── Read all flags from Redis ─────────────────────────
+    flags = await get_flags()
+    log.info("summarize_flags", **flags)
+
+    if not flags["summarize_enabled"]:
+        log.info("summarization_disabled_by_flag")
+        return {"summarized": 0, "disabled": True}
+
+    MAX_DAILY     = int(flags["max_daily_summaries"])
+    TOP_N         = int(flags["top_n"])
+    MIN_WORDS     = int(flags["min_words"])
+    SEM_ENABLED   = bool(flags["semantic_dedup_enabled"])
+    SEM_THRESHOLD = float(settings.semantic_dedup_threshold)
+    JACCARD_TH    = 0.55
+    CONCURRENCY   = 1
+    ARTICLE_TO    = 45
+
+    # Daily budget check
+    today      = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    budget_key = f"daily_summaries:{today}"
     daily_count = int(await redis.get(budget_key) or 0)
-    if daily_count >= MAX_DAILY_SUMMARIES:
-        log.info("daily_budget_reached", count=daily_count, limit=MAX_DAILY_SUMMARIES)
+    if daily_count >= MAX_DAILY:
+        log.info("daily_budget_reached", count=daily_count, limit=MAX_DAILY)
         return {"summarized": 0, "skipped_budget": daily_count}
 
-    remaining  = MAX_DAILY_SUMMARIES - daily_count
+    remaining  = MAX_DAILY - daily_count
     summarizer = _get_summarizer()
-
-    stats = {"summarized": 0, "skipped_stub": 0, "skipped_dedup_jaccard": 0,
-             "skipped_dedup_semantic": 0, "skipped_cache": 0}
+    stats      = {"summarized": 0, "skipped_stub": 0,
+                  "skipped_dedup_jaccard": 0, "skipped_dedup_semantic": 0,
+                  "skipped_cache": 0}
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async with AsyncSessionLocal() as db:
@@ -311,14 +354,13 @@ async def _summarize_pending() -> dict:
         # Stage 2 prep: batch-embed every candidate title + every recent
         # title in ONE call, so process_one() below only does cheap
         # in-memory cosine similarity — no per-article model calls.
-        embeddings_map: dict[str, list[float]] = {}
-        if settings.semantic_dedup_enabled:
+        embeddings_map: dict = {}
+        if SEM_ENABLED:
             all_titles = [a.title_en for a in to_proc] + recent_titles
             try:
                 embeddings_map = await _batch_get_embeddings(redis, all_titles)
             except Exception as e:
                 log.warning("embedding_batch_failed", error=str(e))
-                embeddings_map = {}
 
         async def process_one(article) -> None:
             async with sem:
@@ -326,7 +368,7 @@ async def _summarize_pending() -> dict:
                     content    = article.full_content_en or article.summary_en or article.title_en
                     word_count = len(content.split())
 
-                    # A3: stub — skip Bedrock entirely
+                    # Stub skip
                     if word_count < MIN_WORDS:
                         desc = (article.summary_en or content)[:400]
                         await repo.update_summary(
@@ -337,9 +379,9 @@ async def _summarize_pending() -> dict:
                         stats["skipped_stub"] += 1
                         return
 
-                    # B1 Stage 1: Jaccard — cheap, runs first
+                    # Jaccard dedup - cheap, runs first
                     for rt in recent_titles:
-                        if _title_similarity(article.title_en, rt) >= JACCARD_THRESHOLD:
+                        if _title_similarity(article.title_en, rt) >= JACCARD_TH:
                             similar = await repo.find_similar_summarized(rt)
                             if similar:
                                 await repo.update_summary(
@@ -351,12 +393,12 @@ async def _summarize_pending() -> dict:
                                 stats["skipped_dedup_jaccard"] += 1
                                 return
 
-                    # B1 Stage 2: semantic — only if Stage 1 found nothing
-                    if settings.semantic_dedup_enabled and embeddings_map:
+                    # Semantic dedup
+                    if SEM_ENABLED and embeddings_map:
                         best_title, best_sim = _best_semantic_match(
                             article.title_en, recent_titles, embeddings_map
                         )
-                        if best_sim >= SEMANTIC_THRESHOLD:
+                        if best_sim >= SEM_THRESHOLD:
                             similar = await repo.find_similar_summarized(best_title)
                             if similar:
                                 await repo.update_summary(
@@ -366,36 +408,35 @@ async def _summarize_pending() -> dict:
                                 )
                                 await db.commit()
                                 stats["skipped_dedup_semantic"] += 1
-                                log.debug("semantic_dedup_match", title=article.title_en[:60],
-                                          matched=best_title[:60], similarity=round(best_sim, 3))
                                 return
 
-                    # B2: summary hash cache
+                    # Summary hash cache
                     content_hash = hashlib.sha256(
                         f"{article.title_en}:{content[:400]}".encode()
                     ).hexdigest()
                     cache_key = f"summary:{content_hash}"
-                    cached = await redis.get(cache_key)
+                    cached    = await redis.get(cache_key)
                     if cached:
                         data = json.loads(cached)
                         await repo.update_summary(
-                            article, sentence_1=data["s1"], sentence_2=data["s2"], sentence_3=data["s3"],
-                            category=data["cat"], is_breaking=False,
+                            article, sentence_1=data["s1"], sentence_2=data["s2"],
+                            sentence_3=data["s3"], category=data["cat"], is_breaking=False,
                         )
                         await db.commit()
                         stats["skipped_cache"] += 1
                         return
 
-                    # ── Call Bedrock ──────────────────────────────
-                    summary = await asyncio.wait_for(
-                        summarizer.summarize(article.title_en, content), timeout=ARTICLE_TIMEOUT,
+                    # Call LLM
+                    summary  = await asyncio.wait_for(
+                        summarizer.summarize(article.title_en, content),
+                        timeout=ARTICLE_TO,
                     )
-
                     category = _heuristic_cat(article.title_en)
                     if category == "world":
                         try:
                             category = await asyncio.wait_for(
-                                summarizer.categorize(article.title_en, content[:300]), timeout=15,
+                                summarizer.categorize(article.title_en, content[:300]),
+                                timeout=15,
                             )
                         except asyncio.TimeoutError:
                             pass
@@ -403,17 +444,15 @@ async def _summarize_pending() -> dict:
                     is_breaking = _detect_breaking(
                         article.title_en, article.source_name, article.published_at
                     )
-
                     await repo.update_summary(
-                        article, sentence_1=summary.sentence_1, sentence_2=summary.sentence_2,
-                        sentence_3=summary.sentence_3, category=category, is_breaking=is_breaking,
+                        article, sentence_1=summary.sentence_1,
+                        sentence_2=summary.sentence_2, sentence_3=summary.sentence_3,
+                        category=category, is_breaking=is_breaking,
                     )
-
                     await redis.setex(cache_key, 86400 * 7, json.dumps({
                         "s1": summary.sentence_1, "s2": summary.sentence_2,
                         "s3": summary.sentence_3, "cat": category,
                     }))
-
                     await redis.incr(budget_key)
                     await redis.expire(budget_key, 86400)
 
@@ -432,8 +471,7 @@ async def _summarize_pending() -> dict:
         await asyncio.gather(*[process_one(a) for a in to_proc])
 
     try:
-        deleted = await cache.delete_pattern("stories:*")
-        log.info("cache_invalidated", keys=deleted)
+        await cache.delete_pattern("stories:*")
     except Exception as e:
         log.warning("cache_invalidate_failed", error=str(e))
 
@@ -455,24 +493,3 @@ async def _cleanup() -> dict:
         )
         await db.commit()
     return {"deactivated": result.rowcount}
-
-
-# ── Shared helpers ────────────────────────────────────────────
-
-def _heuristic_cat(title: str) -> str:
-    t = title.lower()
-    if any(w in t for w in ["health","disease","vaccine","hospital","cancer","covid","drug","medical"]):
-        return "health"
-    if any(w in t for w in ["climate","carbon","emissions","renewable","drought","flood","wildfire"]):
-        return "climate"
-    if any(w in t for w in ["football","soccer","basketball","tennis","olympic","sport","nba","nfl","fifa"]):
-        return "sports"
-    if any(w in t for w in ["science","research","nasa","space","biology","physics"]):
-        return "science"
-    if any(w in t for w in ["economy","stock","gdp","trade","market","bank","inflation"]):
-        return "business"
-    if any(w in t for w in ["ai","tech","software","apple","google","chip","cyber","robot","startup"]):
-        return "tech"
-    if any(w in t for w in ["art","music","film","movie","culture","book","oscar"]):
-        return "arts"
-    return "world"

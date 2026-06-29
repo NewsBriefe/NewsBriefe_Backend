@@ -21,6 +21,7 @@ from app.api.v1.endpoints.routes import router as stories_router
 from app.api.v1.endpoints.admin import router as admin_router
 from app.api.v1.endpoints.subscribers import router as subscribers_router
 from .models.orm import HealthResponse
+from app.api.v1.endpoints.flags import router as flags_router
 
 settings = get_settings()
 log = get_logger(__name__)
@@ -29,7 +30,7 @@ log = get_logger(__name__)
 async def _wait_for_db(max_retries: int = 10, delay: float = 2.0) -> None:
     from app.core.database import engine
     from app.models.orm import Base
-    from app.models.subscriber import Subscriber  # ensure table is registered
+    from app.models.subscriber import Subscriber  # noqa: F401  # ensure table is registered
     from sqlalchemy import text
 
     log.info("db_connecting", url=settings.database_url, max_retries=max_retries)
@@ -44,9 +45,11 @@ async def _wait_for_db(max_retries: int = 10, delay: float = 2.0) -> None:
             return
         except Exception as exc:
             if attempt == max_retries:
-                log.error("db_connection_failed", url=settings.database_url, attempts=attempt, error=str(exc))
+                log.error("db_connection_failed", url=settings.database_url,
+                          attempts=attempt, error=str(exc))
                 raise
-            log.warning("db_not_ready_retrying", attempt=attempt, max=max_retries, delay=delay, error=str(exc))
+            log.warning("db_not_ready_retrying", attempt=attempt, max=max_retries,
+                        delay=delay, error=str(exc))
             await asyncio.sleep(delay)
 
 
@@ -82,16 +85,8 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
-        description=(
-            "NewsBrief API — Short, clear, translated news for everyone.\n\n"
-            "## Features\n"
-            "- 3-sentence AI summaries (Claude)\n"
-            "- 20+ language translations (DeepL + Google)\n"
-            "- Deduplicated from 12+ RSS sources + NewsAPI\n"
-            "- 4-hour cache refresh cycle\n"
-        ),
-        docs_url="/docs"    if not settings.is_production else None,
-        redoc_url="/redoc"  if not settings.is_production else None,
+        docs_url="/docs"       if not settings.is_production else None,
+        redoc_url="/redoc"     if not settings.is_production else None,
         openapi_url="/openapi.json" if not settings.is_production else None,
         lifespan=lifespan,
     )
@@ -158,9 +153,10 @@ def create_app() -> FastAPI:
         )
     
     # ── Routes ───────────────────────────────────────────
-    app.include_router(stories_router,    prefix=settings.api_prefix, tags=["news"])
-    app.include_router(admin_router,      prefix=settings.api_prefix, tags=["admin"])
+    app.include_router(stories_router,     prefix=settings.api_prefix, tags=["news"])
+    app.include_router(admin_router,       prefix=settings.api_prefix, tags=["admin"])
     app.include_router(subscribers_router, prefix=settings.api_prefix, tags=["subscribe"])
+    app.include_router(flags_router,       prefix=settings.api_prefix, tags=["flags"])
 
     return app
 

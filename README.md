@@ -295,13 +295,54 @@ ruff check app/
 
 ---
 
-## Step 4 — what's next
+## Admin LLM Flags API usage
 
-| Step | What |
-|------|------|
-| ✅ Step 2 | Flutter app foundation |
-| ✅ Step 3 | FastAPI backend (this) |
-| Step 4 | Wire Flutter ↔ Backend + run on device |
-| Step 5 | Android/iOS permissions (mic, speech) |
-| Step 6 | Offline mode + article caching |
-| Step 7 | App Store / Play Store deployment |
+
+**View all flags:**
+```bash
+GET /v1/admin/flags
+X-Admin-Key: your-admin-key
+```
+
+**Disable LLM summarization:**
+```bash
+POST /v1/admin/flags
+X-Admin-Key: your-admin-key
+{"summarize_enabled": false}
+```
+
+**Re-enable:**
+```bash
+POST /v1/admin/flags
+{"summarize_enabled": true}
+```
+
+**Stop fetching new articles:**
+```bash
+POST /v1/admin/flags
+{"fetch_enabled": false}
+```
+
+**Set daily budget to 0 (LLM off, existing summaries served):**
+```bash
+POST /v1/admin/flags
+{"max_daily_summaries": 0}
+```
+
+**Reset everything to defaults:**
+```bash
+POST /v1/admin/flags/reset
+```
+
+---
+
+## All available flags
+
+| Flag | Default | What it does |
+|---|---|---|
+| `summarize_enabled` | `true` | Send articles to Bedrock/Claude |
+| `fetch_enabled` | `true` | Fetch from RSS + NewsAPI |
+| `semantic_dedup_enabled` | `true` | fastembed Stage 2 dedup |
+| `max_daily_summaries` | `200` | Hard Bedrock call cap per day |
+| `min_words` | `20` | Skip stubs below this word count |
+| `top_n` | `30` | Articles summarized per 15-min run |

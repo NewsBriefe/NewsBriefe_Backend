@@ -26,7 +26,7 @@ class ArticleRepository:
 
     async def get_top_stories(
         self, lang: str, category: str | None, page: int, per_page: int,
-        max_age_hours: int = 168,
+        max_age_hours: int = 720, # 30 days response time limit
     ) -> tuple[list[Article], int]:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
         conditions = [

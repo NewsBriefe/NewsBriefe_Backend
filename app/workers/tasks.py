@@ -1,24 +1,9 @@
 """
 Celery Workers — optimized summarization pipeline
 
-OPTIMIZATIONS ACTIVE:
-  A1. Input truncated to 400 words in bedrock_summarizer.py
-  A2. Heuristic categorization first — Bedrock only when uncertain
-  A3. Skip stubs (< 80 words) — mark summarized using raw description
-  A4. Translation on demand only — NO pre-translation
-  B1. Title similarity dedup, two stages:
-      Stage 1 — Jaccard word-overlap (free, no model, runs always)
-      Stage 2 — fastembed semantic similarity (catches different
-                wording for the same event — only runs when Stage 1
-                finds no match, and only if semantic_dedup_enabled)
-  B2. Summary hash cache — reuse summary if same content seen before
-  C1. Article ranking — score by recency + source quality + breaking flag
-  C2. Top-N selection — summarize only top 30 per run
-  C3. Daily budget cap — hard limit on Bedrock calls per day
-  ############################################################################
-All tuning constants are now read from Redis feature flags at runtime.
-Change them via POST /v1/admin/flags — takes effect on next task run,
-no worker restart needed.
+AI_PROVIDER controls which LLM is used:
+  groq    → GroqSummarizationService    (free, fast, recommended)
+  bedrock → BedrockSummarizationService (AWS, kept for future use)
 """
 import asyncio
 import hashlib
@@ -33,6 +18,7 @@ from app.core.logging import get_logger, setup_logging
 
 settings = get_settings()
 log = get_logger(__name__)
+
 
 # ── Celery setup ─────────────────────────────────────────────
 
@@ -85,19 +71,31 @@ def run_async(coro):
 
 
 def _get_summarizer():
-    if settings.use_bedrock:
+    """
+    Return the configured summarizer or fail fast on invalid configuration.
+    Switch provider by changing AI_PROVIDER — no code changes needed.
+    """
+    provider = settings.ai_provider
+
+    if provider == "groq":
+        from app.services.groq_summarizer import GroqSummarizationService
+        log.info("ai_provider", provider="groq", model=settings.groq_model)
+        return GroqSummarizationService()
+
+    if provider == "bedrock":
         from app.services.bedrock_summarizer import BedrockSummarizationService
         log.info("ai_provider", provider="bedrock", model=settings.bedrock_model_id)
         return BedrockSummarizationService()
-    from app.services.summarizer import SummarizationService
-    log.info("ai_provider", provider="claude", model=settings.claude_model)
-    return SummarizationService()
+
+    raise ValueError(f"Unsupported AI_PROVIDER: {provider}")
 
 
 # ── Breaking news detection ───────────────────────────────────
 
-_BREAKING_KW  = frozenset(["breaking","urgent","alert","flash:","just in","developing","emergency","crisis"])
-_BREAKING_SRC = frozenset(["Reuters","AP News","Bloomberg","BBC","Al Jazeera","AFP","Associated Press"])
+_BREAKING_KW  = frozenset(["breaking","urgent","alert","flash:","just in",
+                            "developing","emergency","crisis"])
+_BREAKING_SRC = frozenset(["Reuters","AP News","Bloomberg","BBC","Al Jazeera",
+                            "AFP","Associated Press"])
 
 def _detect_breaking(title: str, source: str, published_at: datetime) -> bool:
     now = datetime.now(timezone.utc)
@@ -146,7 +144,7 @@ def _title_similarity(t1: str, t2: str) -> float:
     return len(w1 & w2) / len(w1 | w2)
 
 
-# ── B1 Stage 2: semantic embeddings (catches different wording) ──
+# ── Semantic embedding helpers ────────────────────────────────
 
 async def _batch_get_embeddings(redis, texts: list[str]) -> dict[str, list[float]]:
     """
@@ -157,7 +155,7 @@ async def _batch_get_embeddings(redis, texts: list[str]) -> dict[str, list[float
     """
     if not texts:
         return {}
-    unique = list(dict.fromkeys(texts))  # dedupe, preserve order
+    unique = list(dict.fromkeys(texts))
     keys = [f"embedding:{hashlib.sha256(t.encode()).hexdigest()[:16]}" for t in unique]
 
     cached = await redis.mget(keys)
@@ -309,7 +307,7 @@ async def _summarize_pending() -> dict:
 
     # ── Read all flags from Redis ─────────────────────────
     flags = await get_flags()
-    log.info("summarize_flags", **flags)
+    log.info("summarize_flags", **{k: v for k, v in flags.items()})
 
     if not flags["summarize_enabled"]:
         log.info("summarization_disabled_by_flag")
@@ -324,9 +322,8 @@ async def _summarize_pending() -> dict:
     CONCURRENCY   = 1
     ARTICLE_TO    = 45
 
-    # Daily budget check
-    today      = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    budget_key = f"daily_summaries:{today}"
+    today       = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    budget_key  = f"daily_summaries:{today}"
     daily_count = int(await redis.get(budget_key) or 0)
     if daily_count >= MAX_DAILY:
         log.info("daily_budget_reached", count=daily_count, limit=MAX_DAILY)
@@ -336,7 +333,7 @@ async def _summarize_pending() -> dict:
     summarizer = _get_summarizer()
     stats      = {"summarized": 0, "skipped_stub": 0,
                   "skipped_dedup_jaccard": 0, "skipped_dedup_semantic": 0,
-                  "skipped_cache": 0}
+                  "skipped_cache": 0, "failed": 0}
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async with AsyncSessionLocal() as db:
@@ -344,6 +341,7 @@ async def _summarize_pending() -> dict:
 
         candidates = await repo.get_unsummarized(limit=100)
         if not candidates:
+            log.info("no_pending_articles")
             return {**stats}
 
         ranked  = sorted(candidates, key=_rank_article, reverse=True)
@@ -362,34 +360,44 @@ async def _summarize_pending() -> dict:
             except Exception as e:
                 log.warning("embedding_batch_failed", error=str(e))
 
-        async def process_one(article) -> None:
+        async def process_one(candidate) -> None:
+            article_id = candidate.id
             async with sem:
+                article_db = AsyncSessionLocal()
+                article_repo = ArticleRepository(article_db)
                 try:
+                    article = await article_repo.get_by_id(article_id)
+                    if article is None or article.is_summarized:
+                        return
                     content    = article.full_content_en or article.summary_en or article.title_en
                     word_count = len(content.split())
 
-                    # Stub skip
+                    # Skip empty stubs
                     if word_count < MIN_WORDS:
-                        desc = (article.summary_en or content)[:400]
-                        await repo.update_summary(
-                            article, sentence_1=desc, sentence_2="", sentence_3="",
-                            category=_heuristic_cat(article.title_en), is_breaking=False,
+                        await article_repo.update_summary(
+                            article,
+                            sentence_1=article.summary_en or article.title_en,
+                            sentence_2="", sentence_3="",
+                            category=_heuristic_cat(article.title_en),
+                            is_breaking=False,
                         )
-                        await db.commit()
+                        await article_db.commit()
                         stats["skipped_stub"] += 1
                         return
 
-                    # Jaccard dedup - cheap, runs first
+                    # Jaccard dedup
                     for rt in recent_titles:
                         if _title_similarity(article.title_en, rt) >= JACCARD_TH:
-                            similar = await repo.find_similar_summarized(rt)
+                            similar = await article_repo.find_similar_summarized(rt)
                             if similar:
-                                await repo.update_summary(
-                                    article, sentence_1=similar.summary_en,
+                                await article_repo.update_summary(
+                                    article,
+                                    sentence_1=similar.summary_en,
                                     sentence_2="", sentence_3="",
-                                    category=similar.category, is_breaking=similar.is_breaking,
+                                    category=similar.category,
+                                    is_breaking=similar.is_breaking,
                                 )
-                                await db.commit()
+                                await article_db.commit()
                                 stats["skipped_dedup_jaccard"] += 1
                                 return
 
@@ -399,14 +407,16 @@ async def _summarize_pending() -> dict:
                             article.title_en, recent_titles, embeddings_map
                         )
                         if best_sim >= SEM_THRESHOLD:
-                            similar = await repo.find_similar_summarized(best_title)
+                            similar = await article_repo.find_similar_summarized(best_title)
                             if similar:
-                                await repo.update_summary(
-                                    article, sentence_1=similar.summary_en,
+                                await article_repo.update_summary(
+                                    article,
+                                    sentence_1=similar.summary_en,
                                     sentence_2="", sentence_3="",
-                                    category=similar.category, is_breaking=similar.is_breaking,
+                                    category=similar.category,
+                                    is_breaking=similar.is_breaking,
                                 )
-                                await db.commit()
+                                await article_db.commit()
                                 stats["skipped_dedup_semantic"] += 1
                                 return
 
@@ -418,36 +428,33 @@ async def _summarize_pending() -> dict:
                     cached    = await redis.get(cache_key)
                     if cached:
                         data = json.loads(cached)
-                        await repo.update_summary(
-                            article, sentence_1=data["s1"], sentence_2=data["s2"],
-                            sentence_3=data["s3"], category=data["cat"], is_breaking=False,
+                        await article_repo.update_summary(
+                            article,
+                            sentence_1=data["s1"], sentence_2=data["s2"], sentence_3=data["s3"],
+                            category=data["cat"], is_breaking=False,
                         )
-                        await db.commit()
+                        await article_db.commit()
                         stats["skipped_cache"] += 1
                         return
 
-                    # Call LLM
+                    # ── Call LLM ──────────────────────────────────
                     summary  = await asyncio.wait_for(
                         summarizer.summarize(article.title_en, content),
                         timeout=ARTICLE_TO,
                     )
+                    # Categorization stays local to save a second LLM call.
                     category = _heuristic_cat(article.title_en)
-                    if category == "world":
-                        try:
-                            category = await asyncio.wait_for(
-                                summarizer.categorize(article.title_en, content[:300]),
-                                timeout=15,
-                            )
-                        except asyncio.TimeoutError:
-                            pass
 
                     is_breaking = _detect_breaking(
                         article.title_en, article.source_name, article.published_at
                     )
-                    await repo.update_summary(
-                        article, sentence_1=summary.sentence_1,
-                        sentence_2=summary.sentence_2, sentence_3=summary.sentence_3,
-                        category=category, is_breaking=is_breaking,
+                    await article_repo.update_summary(
+                        article,
+                        sentence_1=summary.sentence_1,
+                        sentence_2=summary.sentence_2,
+                        sentence_3=summary.sentence_3,
+                        category=category,
+                        is_breaking=is_breaking,
                     )
                     await redis.setex(cache_key, 86400 * 7, json.dumps({
                         "s1": summary.sentence_1, "s2": summary.sentence_2,
@@ -455,20 +462,27 @@ async def _summarize_pending() -> dict:
                     }))
                     await redis.incr(budget_key)
                     await redis.expire(budget_key, 86400)
-
                     recent_titles.append(article.title_en)
-                    await db.commit()
+                    await article_db.commit()
                     stats["summarized"] += 1
-                    log.info("article_summarized", id=article.id, category=category)
+                    log.info("article_summarized", id=article.id,
+                             category=category, provider=settings.ai_provider)
 
                 except asyncio.TimeoutError:
-                    log.warning("article_timeout", id=article.id)
-                    await db.rollback()
+                    log.warning("article_timeout", id=article_id)
+                    await article_db.rollback()
+                    stats["failed"] += 1
                 except Exception as e:
-                    log.error("summarize_failed", id=article.id, error=str(e))
-                    await db.rollback()
+                    log.error("summarize_failed", id=article_id, error=str(e))
+                    await article_db.rollback()
+                    stats["failed"] += 1
+                finally:
+                    await article_db.close()
 
         await asyncio.gather(*[process_one(a) for a in to_proc])
+
+    if to_proc and stats["failed"] == len(to_proc):
+        raise RuntimeError("All articles failed summarization")
 
     try:
         await cache.delete_pattern("stories:*")

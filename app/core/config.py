@@ -1,15 +1,14 @@
 import os
 import re
 from functools import lru_cache
-from typing import Any
-from pydantic import Field, model_validator
+from typing import Any, Literal
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _running_in_docker = os.getenv("DOCKER", "").lower() == "true"
 
 
 def _clean_redis_url(url: str) -> str:
-    """Strip query params from Redis URL — used for Celery broker/backend."""
     return re.sub(r'\?.*$', '', url) if url else url
 
 
@@ -18,6 +17,7 @@ class Settings(BaseSettings):
         env_file=None if _running_in_docker else ".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
 
     # ── App ───────────────────────────────────────────────
@@ -42,19 +42,30 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = 14_400
 
     # ── Celery ────────────────────────────────────────────
-    celery_broker_url: str = "redis://redis:6379/0"
-    celery_result_backend: str = "redis://redis:6379/0"
+    celery_broker_url: str = "redis://redis:6379/1"
+    celery_result_backend: str = "redis://redis:6379/2"
 
     # ── AI Provider ───────────────────────────────────────
-    ai_provider: str = Field(default="claude")
+    # Values: groq | bedrock
+    # Switch by changing this one env var — no code changes needed.
+    ai_provider: Literal["groq", "bedrock"] = Field(default="groq")
 
-    # ── Claude ────────────────────────────────────────────
+    # ── Groq (FREE tier) ───────────────────
+    # Get key at console.groq.com — no credit card needed
+    groq_api_key: str = Field(default="")
+    groq_model: str = Field(default="openai/gpt-oss-20b")
+    groq_max_input_words: int = Field(default=300, ge=100, le=1000)
+    groq_max_output_tokens: int = Field(default=220, ge=100, le=500)
+    groq_timeout_seconds: int = Field(default=30, ge=1, le=120)
+    groq_max_retries: int = Field(default=3, ge=0, le=10)
+
+    # ── Claude / Anthropic ────────────────────────────────
     anthropic_api_key: str = Field(default="")
     claude_model: str = "claude-sonnet-4-20250514"
     claude_max_tokens: int = 512
     claude_timeout_seconds: int = 30
 
-    # ── AWS Bedrock ───────────────────────────────────────
+    # ── AWS Bedrock (kept for future use) ─────────────────
     aws_access_key_id: str = Field(default="")
     aws_secret_access_key: str = Field(default="")
     aws_region: str = Field(default="us-east-1")
@@ -71,13 +82,12 @@ class Settings(BaseSettings):
     dedup_similarity_threshold: float = 0.75
 
     # ── Token-optimization feature flags ──────────────────
-    # Stage 2 of dedup: semantic embedding similarity (catches
-    # different wording, same event). Stage 1 (Jaccard word-overlap)
-    # always runs since it's free. Disable this if you want to skip
-    # the fastembed model load entirely (e.g. very constrained envs).
     semantic_dedup_enabled: bool = Field(default=True)
     semantic_dedup_threshold: float = Field(default=0.86)
     max_daily_summaries: int = Field(default=200)
+
+    # ── Story visibility window ───────────────────────────
+    max_story_age_hours: int = Field(default=720)   # 30 days
 
     # ── Rate limiting ────────────────────────────────────
     rate_limit_per_minute: int = 60
@@ -92,6 +102,11 @@ class Settings(BaseSettings):
 
     # ── Sentry ───────────────────────────────────────────
     sentry_dsn: str = ""
+
+    @field_validator("ai_provider", mode="before")
+    @classmethod
+    def _normalize_ai_provider(cls, value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
 
     @model_validator(mode="before")
     @classmethod
@@ -127,6 +142,10 @@ class Settings(BaseSettings):
     @property
     def use_bedrock(self) -> bool:
         return self.ai_provider.lower() == "bedrock"
+
+    @property
+    def use_groq(self) -> bool:
+        return self.ai_provider.lower() == "groq"
 
 
 @lru_cache

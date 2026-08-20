@@ -4,7 +4,7 @@
 set -e
 
 echo "Starting NewsBrief Celery services..."
-echo "AI Provider: ${AI_PROVIDER:-claude}"
+echo "AI Provider: ${AI_PROVIDER:-groq}"
 echo "Broker: ${CELERY_BROKER_URL:-not set}"
 
 # ── Health check HTTP server ──────────────────────────────────

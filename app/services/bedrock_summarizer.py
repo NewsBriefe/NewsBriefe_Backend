@@ -6,7 +6,7 @@ Uses DeepSeek R1 via AWS Bedrock with boto3.
 
 Usage:
   Set AI_PROVIDER=bedrock in your environment to use this instead of Claude.
-  Set AI_PROVIDER=claude (default) to use the Anthropic Claude provider.
+  Set AI_PROVIDER=groq (default) to use the Groq provider.
 
 Required env vars when AI_PROVIDER=bedrock:
   AWS_ACCESS_KEY_ID      — your AWS access key

@@ -29,6 +29,8 @@ services:
   api:
     build: { context: ., dockerfile: Dockerfile }
     restart: unless-stopped
+    volumes:
+      - fastembed_cache:/app/.fastembed
     env_file:
       - .env
     ports:
@@ -43,6 +45,8 @@ services:
   worker:
     build: { context: ., dockerfile: Dockerfile }
     restart: unless-stopped
+    volumes:
+      - fastembed_cache:/app/.fastembed
     env_file:
       - .env
     depends_on:
@@ -67,4 +71,5 @@ services:
 
 volumes:
   postgres_data:
+  fastembed_cache:
   redis_data:

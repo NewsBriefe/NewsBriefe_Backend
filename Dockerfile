@@ -9,6 +9,9 @@ WORKDIR /app
 COPY pyproject.toml .
 RUN mkdir -p app && touch app/__init__.py
 
+RUN mkdir -p /app/.fastembed && chown appuser /app/.fastembed
+ENV FASTEMBED_CACHE_PATH=/app/.fastembed
+
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir .
 

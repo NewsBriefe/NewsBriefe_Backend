@@ -40,6 +40,11 @@ services:
     environment:
       SERVICE: api
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    
+    networks:
+        default:
+        web:
+          aliases: [newsbrief-api]
 
   worker:
     image: backend:latest
@@ -70,23 +75,12 @@ services:
       --loglevel=info
       --scheduler redbeat.RedBeatScheduler
 
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on: [api]
-    environment:
-      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
 
 volumes:
   fastembed_cache:
   postgres_data:
   redis_data:
-  caddy_data:
-  caddy_config:
+
+  networks:
+    web:
+      external: true
